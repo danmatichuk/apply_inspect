@@ -674,4 +674,30 @@ proof -
     expect_use_thm \<^context> (Apply_Inspect.Fact ("local.local_rule", 0)) @{thm local_rule}\<close>
   oops
 
+text \<open>
+  A failed proof of an earlier theorem does not affect the inspection of later goals, as in PIDE,
+  where a failed proof does not stop the theory. The failed proof is simulated by a fact with a
+  failed proof promise, in a theory that is not committed.
+\<close>
+
+ML_val \<open>
+  let
+    val failed = Thm.future (Future.value_result (Exn.Exn (ERROR "Failed proof"))) \<^cprop>\<open>False\<close>;
+    val (_, thy) = Global_Theory.store_thm (\<^binding>\<open>failed_fact\<close>, failed) \<^theory>;
+    val _ =
+      if can Global_Theory.get_thm_names thy then error "Failed proof not simulated" else ();
+    val state =
+      Proof.theorem NONE (K I) [[(\<^prop>\<open>(n::nat) + 1 < n\<close>, [])]]
+        (Proof_Context.init_global thy);
+    val ctxt = Proof.context_of state;
+    val text = read_text ctxt "simp";
+    val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+  in
+    (case Apply_Inspect.inspect params text state of
+      {succeeded = true, error = NONE, uses} =>
+        if null uses then error "No uses reported" else ()
+    | {error = SOME msg, ...} => error ("Error: " ^ msg)
+    | _ => error "Method failed")
+  end\<close>
+
 end

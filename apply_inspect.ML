@@ -135,13 +135,54 @@ fun local_facts ctxt =
 fun prefer_single (thm_name: Thm_Name.T) (thm_name': Thm_Name.T) =
   if #2 thm_name = 0 andalso #2 thm_name' <> 0 then thm_name else thm_name';
 
+(*Global_Theory.lookup_thm_id builds the name table of a theory from the derivations of all of
+  its facts, which joins their proofs: a single failed proof makes every lookup in that theory
+  fail. This happens in PIDE, where a failed proof of an earlier theorem does not stop the
+  theory. Such theories get a table of their own here, without the facts whose proofs fail.*)
+fun lookup_thm_id thy =
+  let
+    val global_lookup = Global_Theory.lookup_thm_id thy;
+    val theories =
+      Symtab.build (Theory.nodes_of thy |> fold (fn thy' =>
+        Symtab.update (Context.theory_long_name thy', thy')));
+    fun make_thm_names thy' =
+      Global_Theory.dest_thms true (Theory.parents_of thy') thy'
+      |> fold (fn (thm_name, thm) =>
+          (case try Thm.derivation_id (Thm.transfer thy' thm) of
+            SOME (SOME {serial, ...}) => Inttab.default (serial, thm_name)
+          | _ => I))
+      |> (fn f => f Inttab.empty);
+    val own_tables = Synchronized.var "apply_inspect_thm_names" Symtab.empty;
+    fun own_table theory_name =
+      Synchronized.change_result own_tables (fn tabs =>
+        (case Symtab.lookup tabs theory_name of
+          SOME tab => (tab, tabs)
+        | NONE =>
+            let
+              val tab =
+                Lazy.lazy (fn () =>
+                  (case Symtab.lookup theories theory_name of
+                    SOME thy' => make_thm_names thy'
+                  | NONE => Inttab.empty));
+            in (tab, Symtab.update (theory_name, tab) tabs) end));
+    fun own_lookup (thm_id: Proofterm.thm_id) =
+      Inttab.lookup (Lazy.force (own_table (#theory_name thm_id))) (#serial thm_id);
+  in
+    fn thm_id =>
+      if Symtab.defined (Synchronized.value own_tables) (#theory_name thm_id)
+      then own_lookup thm_id
+      else
+        (case Exn.result global_lookup thm_id of
+          Exn.Res res => res
+        | Exn.Exn _ => own_lookup thm_id)
+  end;
+
 (*local facts of a proof context, as the serials of their own (unnamed) dependency nodes, e.g.
   from the closed derivation of "have", with the serials of the other dependency nodes that
   come with them (e.g. Pure.protectD)*)
-fun fact_serials ctxt =
+fun fact_serials ctxt lookup =
   let
     val thy = Proof_Context.theory_of ctxt;
-    val lookup = Global_Theory.lookup_thm_id thy;
     (*unnamed nodes, without proofs of sort constraints*)
     fun own_nodes thm =
       (case try (Thm.thm_deps o Thm.transfer thy) thm of
@@ -342,8 +383,8 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
   let
     val thy = Proof_Context.theory_of ctxt;
     val facts = Global_Theory.facts_of thy;
-    val global_lookup = Global_Theory.lookup_thm_id thy;
-    val fact_serials = fact_serials ctxt;
+    val global_lookup = lookup_thm_id thy;
+    val fact_serials = fact_serials ctxt global_lookup;
     fun lookup (i, thm_node) =
       (case Inttab.lookup fact_serials i of
         SOME (thm_name, _) => SOME (Fact thm_name)
