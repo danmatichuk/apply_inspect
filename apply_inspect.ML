@@ -7,8 +7,10 @@ The method is first run on a copy of the goal state that is produced by an
 oracle (so that it has no theorem dependencies of its own), in a context
 where the classical reasoner and the simplifier record every intermediate
 goal state they see, and the simplifier records every rewrite rule it
-tries. The results of that run are always discarded: if the method
-succeeds, it is run again without instrumentation.
+tries. Before each method or classical step, the goal state is copied again
+in the same way, so that the result of the step depends on exactly the
+theorems that the step used. The results of that run are always discarded:
+if the method succeeds, it is run again without instrumentation.
 *)
 
 signature APPLY_INSPECT =
@@ -35,6 +37,13 @@ val every_use =
 
 val (_, fresh_state) =
   Context.>>> (Context.map_theory_result (Thm.add_oracle (\<^binding>\<open>apply_inspect\<close>, I)));
+
+(*copy of the goal state without dependencies, unless the copy would differ in hypotheses or
+  flex-flex constraints (which would affect the behaviour of tactics)*)
+fun refresh_state st =
+  (case try fresh_state (Thm.cprop_of st) of
+    SOME st' => if Thm.eq_thm (st, st') then st' else st
+  | NONE => st);
 
 
 (* loop detection *)
@@ -185,7 +194,10 @@ val hook_name = "apply_inspect";
 fun instrument_context ({observe, step, ...}: events) ctxt =
   let
     fun wrapper _ tac i st =
-      (observe "classical" st; Seq.map (tap (step "classical" st)) (tac i st));
+      let
+        val _ = observe "classical" st;
+        val st0 = refresh_state st;
+      in Seq.map (tap (step "classical" st0)) (tac i st0) end;
     fun observe_tac (_: Proof.context) (_: int) st = (observe "simp" st; Seq.empty);
     val solver = Simplifier.mk_solver hook_name observe_tac;
   in
@@ -212,10 +224,14 @@ fun simp_trace_ops ({rewrite, ...}: events) : Raw_Simplifier.trace_ops =
 fun instrument_text ({observe, step, ...}: events) =
   let
     fun wrap_method source (m: Method.method) : Method.method = fn facts => fn (ctxt, st) =>
-      (observe source st;
-        m facts (ctxt, st) |> Seq.map (fn result =>
-          ((case result of Seq.Result (_, st') => step source st st' | Seq.Error _ => ());
-            result)));
+      let
+        val _ = observe source st;
+        val st0 = refresh_state st;
+      in
+        m facts (ctxt, st0) |> Seq.map (fn result =>
+          ((case result of Seq.Result (_, st') => step source st0 st' | Seq.Error _ => ());
+            result))
+      end;
     fun wrap (Method.Source src) =
           Method.Basic (fn ctxt =>
             wrap_method (#1 (Token.name_of_src src)) (Method.method_cmd ctxt src ctxt))

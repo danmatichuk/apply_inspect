@@ -9,7 +9,8 @@ fun inspect_test state src =
     val proof_state = Toplevel.proof_of state;
     val ctxt = Proof.context_of proof_state;
     val (text, _) = Method.read_closure_input ctxt (Input.string src);
-    val {succeeded, deps} = Apply_Inspect.inspect {every_use = false, on_use = K (K ()), on_loop = K ()} text proof_state;
+    val params = {every_use = false, on_use = K (K ()), on_loop = K ()};
+    val {succeeded, deps} = Apply_Inspect.inspect params text proof_state;
     val _ = Pretty.writeln (Apply_Inspect.pretty_deps ctxt deps);
   in (succeeded, map (#1 o #1) deps) end;
 
@@ -20,7 +21,8 @@ fun count_uses every_use state src =
     val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
     val used = Synchronized.var "used" [];
     fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
-    val _ = Apply_Inspect.inspect {every_use = every_use, on_use = on_use, on_loop = K ()} text proof_state;
+    val params = {every_use = every_use, on_use = on_use, on_loop = K ()};
+    val _ = Apply_Inspect.inspect params text proof_state;
   in fn name => length (filter (equal name) (Synchronized.value used)) end;
 
 fun expect_failed_with state src names =
@@ -139,7 +141,8 @@ context
 begin
 
 lemma "z = 1"
-  ML_val \<open>expect_failed_with @{Isar.state} "(simp add: z f_g, fail)" ["Apply_Inspect_Test.f_g"]\<close>
+  ML_val \<open>expect_failed_with @{Isar.state} "(simp add: z f_g, fail)"
+    ["Apply_Inspect_Test.f_g"]\<close>
   oops
 
 lemma "z = g 0 \<and> rev (rev xs) = xs"
@@ -162,13 +165,33 @@ text \<open>Every use of a theorem can be reported, not just the first one.\<clo
 lemma "((xs::nat list) = ys \<and> ys = zs) \<and> zs = xs"
   ML_val \<open>
     let
-      val src = "((rule conjI, fail) | (rule conjI, fail))";
-      val first = count_uses false @{Isar.state} src "HOL.conjI";
-      val every = count_uses true @{Isar.state} src "HOL.conjI";
+      fun counts src =
+        (count_uses false @{Isar.state} src "HOL.conjI",
+          count_uses true @{Isar.state} src "HOL.conjI");
+      val sequential = counts "(rule conjI, rule conjI, fail)";
+      val branches = counts "((rule conjI, fail) | (rule conjI, fail))";
     in
-      if first = 1 andalso every = 2 then ()
-      else error ("Bad counts: " ^ string_of_int first ^ ", " ^ string_of_int every)
+      (case (sequential, branches) of
+        ((1, 2), (1, 2)) => ()
+      | ((a, b), (c, d)) => error ("Bad counts: " ^ commas (map string_of_int [a, b, c, d])))
     end\<close>
+  oops
+
+lemma "Q 0"
+  ML_val \<open>
+    let
+      val state = Toplevel.proof_of @{Isar.state};
+      val (text, _) =
+        Method.read_closure_input (Proof.context_of state) (Input.string "(fast intro: Q_step)");
+      val used = Synchronized.var "used" [];
+      fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+      val params = {every_use = true, on_use = on_use, on_loop = K ()};
+      val _ =
+        (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
+          error "Method terminated")
+        handle Timeout.TIMEOUT _ => ();
+      val n = length (filter (equal "Apply_Inspect_Test.Q_step") (Synchronized.value used));
+    in if n >= 10 then () else error ("Too few uses of Q_step: " ^ string_of_int n) end\<close>
   oops
 
 lemma "rev (rev (rev (rev xs))) = ys"
@@ -241,8 +264,10 @@ fun expect_no_loop state src =
   end;
 \<close>
 
-lemma "length [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24] = 24 \<and>
-    map Suc [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24] \<noteq> []"
+lemma "length [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12,
+      x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24] = 24 \<and>
+    map Suc [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12,
+      x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24] \<noteq> []"
   ML_val \<open>expect_no_loop @{Isar.state} "simp"\<close>
   oops
 
@@ -258,6 +283,64 @@ lemma "sum_list [1..<30] = (435::nat)"
 lemma "rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev
     (rev (rev (rev (rev (rev (rev xs))))))))))))))))))))))) = xs"
   ML_val \<open>expect_no_loop @{Isar.state} "simp"\<close>
+  oops
+
+
+text \<open>Instrumentation does not change whether a method succeeds.\<close>
+
+ML \<open>
+fun expect_same_outcome state srcs =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val ctxt = Proof.context_of proof_state;
+    fun check src =
+      let
+        val (text, _) = Method.read_closure_input ctxt (Input.string src);
+        (*NONE: timeout*)
+        fun outcome f =
+          SOME (Timeout.apply (seconds 3.0) (fn () => the_default false (try f ())) ())
+            handle Timeout.TIMEOUT _ => NONE;
+        val plain =
+          outcome (fn () =>
+            Proof.apply (text, Position.no_range) proof_state
+            |> Seq.filter_results |> Seq.pull |> is_some);
+        val params = {every_use = false, on_use = K (K ()), on_loop = K ()};
+        val inspected =
+          outcome (fn () => #succeeded (Apply_Inspect.inspect params text proof_state));
+      in
+        (case (plain, inspected) of
+          (SOME b1, SOME b2) =>
+            if b1 = b2 then ()
+            else error ("Different outcome for " ^ src ^ ": " ^ Bool.toString b1 ^ " vs. " ^
+              Bool.toString b2)
+        | _ => ())
+      end;
+  in List.app check srcs end;
+
+val outcome_methods =
+  ["auto", "simp", "clarsimp", "fastforce", "force", "blast", "fast", "best", "safe", "clarify",
+   "(auto simp: P_def)", "(fastforce simp: P_def)", "(rule exI, rule refl)", "(rule exI)",
+   "(rule conjI, auto)", "(intro allI impI, auto)", "(auto intro: P_nonzero)", "metis"];
+\<close>
+
+lemma "\<forall>x. P x \<longrightarrow> x \<noteq> 0"
+  ML_val \<open>expect_same_outcome @{Isar.state} outcome_methods\<close>
+  oops
+
+lemma "\<exists>x::nat. x = Suc 0 \<and> P x"
+  ML_val \<open>expect_same_outcome @{Isar.state} outcome_methods\<close>
+  oops
+
+lemma "(\<forall>x. x \<in> A \<longrightarrow> x \<in> B) \<Longrightarrow> A \<inter> C \<subseteq> B \<inter> C"
+  ML_val \<open>expect_same_outcome @{Isar.state} outcome_methods\<close>
+  oops
+
+lemma "length (xs @ ys) = length xs + length ys \<and> xs = ys"
+  ML_val \<open>expect_same_outcome @{Isar.state} outcome_methods\<close>
+  oops
+
+lemma "\<exists>f. \<forall>x::nat. f x = Suc x"
+  ML_val \<open>expect_same_outcome @{Isar.state} outcome_methods\<close>
   oops
 
 
