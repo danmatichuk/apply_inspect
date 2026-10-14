@@ -21,6 +21,7 @@ sig
     Fact of Thm_Name.T |
     Assumption of Thm_Name.T * term |
     Rule of thm
+  val use_thm: Proof.context -> use -> thm option
   val declarations: Proof.context -> use -> string list
   val pretty_use: Proof.context -> use -> Pretty.T
   type params =
@@ -57,6 +58,32 @@ val classical_attributes =
   (Bires.dest_kind, "dest"), (Bires.intro_query_kind, "intro?"),
   (Bires.elim_query_kind, "elim?"), (Bires.dest_query_kind, "dest?")];
 
+fun use_name (Theorem (thm_name, _)) = thm_name
+  | use_name (Fact thm_name) = thm_name
+  | use_name (Assumption (thm_name, _)) = thm_name
+  | use_name (Rule _) = Thm_Name.empty;
+
+(*the theorem behind a use: named ones looked up in the context, unnamed assumptions as such*)
+fun use_thm ctxt u =
+  let
+    fun lookup (thm_name as (name, i)) =
+      if Thm_Name.is_empty thm_name then NONE
+      else
+        (case Facts.lookup (Context.Proof ctxt) (Proof_Context.facts_of ctxt) name of
+          SOME {thms, ...} =>
+            if i = 0 then (case thms of [thm] => SOME thm | _ => NONE)
+            else try (nth thms) (i - 1)
+        | NONE => NONE);
+  in
+    (case u of
+      Rule thm => SOME thm
+    | Assumption (thm_name, prop) =>
+        (case lookup thm_name of
+          NONE => try (Thm.assume o Thm.cterm_of ctxt) prop
+        | some => some)
+    | _ => lookup (use_name u))
+  end;
+
 (*attributes under which a used theorem is declared in the context: simp rules by name (the
   rewrite rules derived from a theorem keep its name), classical rules by proposition*)
 fun declarations ctxt =
@@ -65,28 +92,17 @@ fun declarations ctxt =
       fold (fn ((name, i), _) => Symtab.insert_list (op =) (name, i))
         (Raw_Simplifier.dest_simps (Simplifier.simpset_of ctxt)) Symtab.empty;
     val rules = Classical.dest_decls ctxt (K true);
-    val facts = Proof_Context.facts_of ctxt;
 
-    fun lookup (name, i) =
-      (case Facts.lookup (Context.Proof ctxt) facts name of
-        SOME {thms, ...} =>
-          if i = 0 then (case thms of [thm] => SOME thm | _ => NONE)
-          else try (nth thms) (i - 1)
-      | NONE => NONE);
+    fun simp (thm_name as (name, i)) =
+      not (Thm_Name.is_empty thm_name) andalso member (op =) (Symtab.lookup_list simps name) i;
     fun classical thm =
       rules |> map_filter (fn (th, {kind, ...}) =>
         if Thm.eq_thm_prop (th, thm) then AList.lookup (op =) classical_attributes kind
         else NONE);
-    fun named (thm_name as (name, i)) =
-      if Thm_Name.is_empty thm_name then []
-      else
-        (if member (op =) (Symtab.lookup_list simps name) i then ["simp"] else []) @
-        (case lookup thm_name of SOME thm => classical thm | NONE => []);
   in
-    fn Theorem (thm_name, _) => named thm_name
-     | Fact thm_name => named thm_name
-     | Assumption (thm_name, _) => named thm_name
-     | Rule thm => classical thm
+    fn u =>
+      (if simp (use_name u) then ["simp"] else []) @
+      (case use_thm ctxt u of SOME thm => classical thm | NONE => [])
   end;
 
 fun pretty_use ctxt =

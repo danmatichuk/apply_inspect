@@ -642,12 +642,36 @@ ML_val \<open>
   expect_declarations \<^context> (Apply_Inspect.Rule @{thm conjI}) ["intro!"]
 \<close>
 
+text \<open>The theorems behind uses.\<close>
+
+ML \<open>
+fun expect_use_thm ctxt use thm =
+  (case Apply_Inspect.use_thm ctxt use of
+    SOME thm' =>
+      if Thm.eq_thm_prop (thm, thm') then ()
+      else error ("Wrong theorem: " ^ Thm.string_of_thm ctxt thm')
+  | NONE => error "No theorem")
+\<close>
+
+ML_val \<open>
+  expect_use_thm \<^context> (theorem "List.rev_rev_ident") @{thm rev_rev_ident};
+  expect_use_thm \<^context> (Apply_Inspect.Theorem (("HOL.simp_thms", 2), Position.none))
+    (nth @{thms simp_thms} 1);
+  expect_use_thm \<^context> (Apply_Inspect.Rule @{thm conjI}) @{thm conjI};
+  expect_use_thm \<^context> (Apply_Inspect.Assumption (Thm_Name.empty, \<^prop>\<open>x = y\<close>))
+    (Thm.assume \<^cprop>\<open>x = y\<close>);
+  if is_some (Apply_Inspect.use_thm \<^context> (theorem "List.no_such_fact")) then
+    error "Theorem for undefined fact"
+  else ()
+\<close>
+
 lemma "P a"
 proof -
   have local_rule [simp, intro]: "P b \<longleftrightarrow> 0 < b" for b by (simp add: P_def)
   ML_val \<open>
     expect_declarations \<^context> (Apply_Inspect.Fact ("local.local_rule", 0))
-      ["simp", "intro"]\<close>
+      ["simp", "intro"];
+    expect_use_thm \<^context> (Apply_Inspect.Fact ("local.local_rule", 0)) @{thm local_rule}\<close>
   oops
 
 end
