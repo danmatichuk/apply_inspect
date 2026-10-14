@@ -609,4 +609,45 @@ lemma "rev (rev xs) = xs \<and> (xs::nat list) = ys"
     end\<close>
   oops
 
+text \<open>Uses are annotated with their declarations in the context.\<close>
+
+lemma decl_intro [intro]: "x = y \<Longrightarrow> y = x" by simp
+lemma decl_dest [dest]: "x = Suc y \<Longrightarrow> 0 < x" by simp
+lemma decl_simp_elim [simp, elim]: "x < 0 \<Longrightarrow> thesis" for x :: nat by simp
+
+ML \<open>
+fun expect_declarations ctxt use attribs =
+  let
+    val declared = Apply_Inspect.declarations ctxt use;
+    val printed = Pretty.unformatted_string_of (Apply_Inspect.pretty_use ctxt use);
+    val suffix = if null attribs then "" else " [" ^ commas attribs ^ "]";
+  in
+    if declared <> attribs then
+      error (printed ^ ": expected " ^ commas attribs ^ ", got " ^ commas declared)
+    else if not (String.isSuffix suffix printed) then error ("Bad output: " ^ printed)
+    else ()
+  end;
+
+fun theorem name = Apply_Inspect.Theorem ((name, 0), Position.none);
+\<close>
+
+ML_val \<open>
+  expect_declarations \<^context> (theorem "List.rev_rev_ident") ["simp"];
+  expect_declarations \<^context> (theorem "HOL.conjI") ["intro!"];
+  expect_declarations \<^context> (theorem "HOL.conjE") ["elim!"];
+  expect_declarations \<^context> (theorem "Apply_Inspect_Test.decl_intro") ["intro"];
+  expect_declarations \<^context> (theorem "Apply_Inspect_Test.decl_dest") ["dest"];
+  expect_declarations \<^context> (theorem "Apply_Inspect_Test.decl_simp_elim") ["simp", "elim"];
+  expect_declarations \<^context> (theorem "Apply_Inspect_Test.P_nonzero") [];
+  expect_declarations \<^context> (Apply_Inspect.Rule @{thm conjI}) ["intro!"]
+\<close>
+
+lemma "P a"
+proof -
+  have local_rule [simp, intro]: "P b \<longleftrightarrow> 0 < b" for b by (simp add: P_def)
+  ML_val \<open>
+    expect_declarations \<^context> (Apply_Inspect.Fact ("local.local_rule", 0))
+      ["simp", "intro"]\<close>
+  oops
+
 end

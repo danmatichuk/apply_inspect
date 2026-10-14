@@ -21,6 +21,7 @@ sig
     Fact of Thm_Name.T |
     Assumption of Thm_Name.T * term |
     Rule of thm
+  val declarations: Proof.context -> use -> string list
   val pretty_use: Proof.context -> use -> Pretty.T
   type params =
    {every_use: bool,
@@ -50,14 +51,62 @@ datatype use =
   Assumption of Thm_Name.T * term |  (*assumption of the proof context, possibly unnamed*)
   Rule of thm;  (*other rule, e.g. premise of a subgoal*)
 
-fun pretty_use ctxt (Theorem (thm_name, _)) = Global_Theory.pretty_thm_name ctxt thm_name
-  | pretty_use ctxt (Fact thm_name) =
-      Pretty.block [Pretty.str "fact ", Proof_Context.pretty_thm_name ctxt thm_name]
-  | pretty_use ctxt (Assumption (thm_name, prop)) =
-      Pretty.block [Pretty.str "assumption ",
-        if Thm_Name.is_empty thm_name then Pretty.quote (Syntax.pretty_term ctxt prop)
-        else Proof_Context.pretty_thm_name ctxt thm_name]
-  | pretty_use ctxt (Rule thm) = Pretty.block [Pretty.str "rule ", Thm.pretty_thm ctxt thm];
+val classical_attributes =
+ [(Bires.intro_bang_kind, "intro!"), (Bires.elim_bang_kind, "elim!"),
+  (Bires.dest_bang_kind, "dest!"), (Bires.intro_kind, "intro"), (Bires.elim_kind, "elim"),
+  (Bires.dest_kind, "dest"), (Bires.intro_query_kind, "intro?"),
+  (Bires.elim_query_kind, "elim?"), (Bires.dest_query_kind, "dest?")];
+
+(*attributes under which a used theorem is declared in the context: simp rules by name (the
+  rewrite rules derived from a theorem keep its name), classical rules by proposition*)
+fun declarations ctxt =
+  let
+    val simps =
+      fold (fn ((name, i), _) => Symtab.insert_list (op =) (name, i))
+        (Raw_Simplifier.dest_simps (Simplifier.simpset_of ctxt)) Symtab.empty;
+    val rules = Classical.dest_decls ctxt (K true);
+    val facts = Proof_Context.facts_of ctxt;
+
+    fun lookup (name, i) =
+      (case Facts.lookup (Context.Proof ctxt) facts name of
+        SOME {thms, ...} =>
+          if i = 0 then (case thms of [thm] => SOME thm | _ => NONE)
+          else try (nth thms) (i - 1)
+      | NONE => NONE);
+    fun classical thm =
+      rules |> map_filter (fn (th, {kind, ...}) =>
+        if Thm.eq_thm_prop (th, thm) then AList.lookup (op =) classical_attributes kind
+        else NONE);
+    fun named (thm_name as (name, i)) =
+      if Thm_Name.is_empty thm_name then []
+      else
+        (if member (op =) (Symtab.lookup_list simps name) i then ["simp"] else []) @
+        (case lookup thm_name of SOME thm => classical thm | NONE => []);
+  in
+    fn Theorem (thm_name, _) => named thm_name
+     | Fact thm_name => named thm_name
+     | Assumption (thm_name, _) => named thm_name
+     | Rule thm => classical thm
+  end;
+
+fun pretty_use ctxt =
+  let
+    val declared = declarations ctxt;
+    fun pretty (Theorem (thm_name, _)) = Global_Theory.pretty_thm_name ctxt thm_name
+      | pretty (Fact thm_name) =
+          Pretty.block [Pretty.str "fact ", Proof_Context.pretty_thm_name ctxt thm_name]
+      | pretty (Assumption (thm_name, prop)) =
+          Pretty.block [Pretty.str "assumption ",
+            if Thm_Name.is_empty thm_name then Pretty.quote (Syntax.pretty_term ctxt prop)
+            else Proof_Context.pretty_thm_name ctxt thm_name]
+      | pretty (Rule thm) = Pretty.block [Pretty.str "rule ", Thm.pretty_thm ctxt thm];
+  in
+    fn u =>
+      (case distinct (op =) (declared u) of
+        [] => pretty u
+      | attribs =>
+          Pretty.block [pretty u, Pretty.brk 1, Pretty.list "[" "]" (map Pretty.str attribs)])
+  end;
 
 (*named local facts of a proof context, without the ones that are also global*)
 fun local_facts ctxt =
@@ -537,11 +586,12 @@ fun inspect params text state =
 
 fun pretty_uses ctxt uses =
   let
+    val pretty = pretty_use ctxt;
     val items =
       uses
-      |> map (fn u => (Pretty.unformatted_string_of (pretty_use ctxt u), u))
+      |> map (fn u => let val prt = pretty u in (Pretty.unformatted_string_of prt, prt) end)
       |> sort_by #1
-      |> map (fn (_, u) => Pretty.item [pretty_use ctxt u]);
+      |> map (fn (_, prt) => Pretty.item [prt]);
   in
     Pretty.big_list
       ("theorems used in failed method application: " ^ string_of_int (length items)) items
@@ -573,6 +623,7 @@ fun use_filter state criteria =
 fun apply_inspect criteria (text, range as (pos, _)) state =
   let
     val ctxt = Proof.context_of state;
+    val pretty = pretty_use ctxt;
     val printed =
       (case criteria of
         SOME criteria => use_filter state criteria
@@ -580,7 +631,7 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
     fun on_use source u =
       if printed u then
         writeln (Pretty.string_of (Pretty.block [Pretty.str ("used (" ^ source ^ "): "),
-          pretty_use ctxt u]))
+          pretty u]))
       else ();
     fun on_loop source rules =
       let
@@ -591,7 +642,7 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
           | _ => "Proof method " ^ quote source);
         val items =
           if null rules then [Pretty.item [Pretty.str "(no named theorems)"]]
-          else map (Pretty.item o single o pretty_use ctxt) rules;
+          else map (Pretty.item o single o pretty) rules;
       in
         warning (Pretty.string_of
           (Pretty.big_list (what ^ " may be looping, repeatedly using:") items))
