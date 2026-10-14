@@ -9,7 +9,7 @@ fun inspect_test state src =
     val proof_state = Toplevel.proof_of state;
     val ctxt = Proof.context_of proof_state;
     val (text, _) = Method.read_closure_input ctxt (Input.string src);
-    val params = {every_use = false, on_use = K (K ()), on_loop = K ()};
+    val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
     val {succeeded, deps} = Apply_Inspect.inspect params text proof_state;
     val _ = Pretty.writeln (Apply_Inspect.pretty_deps ctxt deps);
   in (succeeded, map (#1 o #1) deps) end;
@@ -21,7 +21,7 @@ fun count_uses every_use state src =
     val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
     val used = Synchronized.var "used" [];
     fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
-    val params = {every_use = every_use, on_use = on_use, on_loop = K ()};
+    val params = {every_use = every_use, on_use = on_use, on_loop = K (K ())};
     val _ = Apply_Inspect.inspect params text proof_state;
   in fn name => length (filter (equal name) (Synchronized.value used)) end;
 
@@ -88,7 +88,7 @@ lemma "Q 0"
         Method.read_closure_input (Proof.context_of state) (Input.string "(fast intro: Q_step)");
       val used = Synchronized.var "used" [];
       fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
-      val params = {every_use = false, on_use = on_use, on_loop = K ()};
+      val params = {every_use = false, on_use = on_use, on_loop = K (K ())};
       val _ =
         (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
           error "Method terminated")
@@ -112,7 +112,7 @@ lemma "f 0 = 1"
         Method.read_closure_input (Proof.context_of state) (Input.string "(simp add: f_g g_f)");
       val used = Synchronized.var "used" [];
       fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
-      val params = {every_use = false, on_use = on_use, on_loop = K ()};
+      val params = {every_use = false, on_use = on_use, on_loop = K (K ())};
       val _ =
         (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
           error "Method terminated")
@@ -185,7 +185,7 @@ lemma "Q 0"
         Method.read_closure_input (Proof.context_of state) (Input.string "(fast intro: Q_step)");
       val used = Synchronized.var "used" [];
       fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
-      val params = {every_use = true, on_use = on_use, on_loop = K ()};
+      val params = {every_use = true, on_use = on_use, on_loop = K (K ())};
       val _ =
         (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
           error "Method terminated")
@@ -216,7 +216,7 @@ fun loop_rules state src =
     val proof_state = Toplevel.proof_of state;
     val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
     val loops = Synchronized.var "loops" [];
-    fun on_loop rules = Synchronized.change loops (cons (map (#1 o #1) rules));
+    fun on_loop _ rules = Synchronized.change loops (cons (map (#1 o #1) rules));
     val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
   in
     (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) proof_state; NONE)
@@ -253,7 +253,7 @@ fun expect_no_loop state src =
     val proof_state = Toplevel.proof_of state;
     val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
     val loops = Synchronized.var "loops" [];
-    fun on_loop rules = Synchronized.change loops (cons (map (#1 o #1) rules));
+    fun on_loop _ rules = Synchronized.change loops (cons (map (#1 o #1) rules));
     val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
     val {succeeded, ...} = Apply_Inspect.inspect params text proof_state;
   in
@@ -271,6 +271,47 @@ lemma "length [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12,
   ML_val \<open>expect_no_loop @{Isar.state} "simp"\<close>
   oops
 
+
+text \<open>Suspected loops of classical search and of repeated proof methods.\<close>
+
+ML \<open>
+fun expect_step_loop state src source names =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
+    val loops = Synchronized.var "loops" [];
+    fun on_loop source' rules =
+      Synchronized.change loops (cons (source', map (#1 o #1) rules));
+    val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
+    val terminated =
+      (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) proof_state; true)
+        handle Timeout.TIMEOUT _ => false;
+  in
+    if terminated then error "Method terminated"
+    else
+      (case AList.lookup (op =) (Synchronized.value loops) source of
+        NONE =>
+          error ("No loop reported for " ^ source ^ ", only for: " ^
+            commas (map #1 (Synchronized.value loops)))
+      | SOME rules =>
+          if eq_set (op =) (rules, names) then ()
+          else error ("Bad loop report: " ^ commas (map quote rules)))
+  end;
+\<close>
+
+lemma "Q 0"
+  ML_val \<open>expect_step_loop @{Isar.state} "(fast intro: Q_step)" "classical"
+    ["Apply_Inspect_Test.Q_step"]\<close>
+  ML_val \<open>expect_step_loop @{Isar.state} "(rule Q_step)+" "rule"
+    ["Apply_Inspect_Test.Q_step"]\<close>
+  oops
+
+axiomatization R :: "nat \<Rightarrow> nat \<Rightarrow> bool" where R_sym: "R x y \<Longrightarrow> R y x"
+
+lemma "R 0 1"
+  ML_val \<open>expect_step_loop @{Isar.state} "(fast intro: R_sym)" "classical"
+    ["Apply_Inspect_Test.R_sym"]\<close>
+  oops
 
 lemma "(2::nat) ^ 20 = 1048576"
   ML_val \<open>expect_no_loop @{Isar.state} "simp"\<close>
@@ -304,15 +345,20 @@ fun expect_same_outcome state srcs =
           outcome (fn () =>
             Proof.apply (text, Position.no_range) proof_state
             |> Seq.filter_results |> Seq.pull |> is_some);
-        val params = {every_use = false, on_use = K (K ()), on_loop = K ()};
+        val loops = Synchronized.var "loops" [];
+        fun on_loop source _ = Synchronized.change loops (cons source);
+        val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
         val inspected =
           outcome (fn () => #succeeded (Apply_Inspect.inspect params text proof_state));
       in
         (case (plain, inspected) of
           (SOME b1, SOME b2) =>
-            if b1 = b2 then ()
-            else error ("Different outcome for " ^ src ^ ": " ^ Bool.toString b1 ^ " vs. " ^
-              Bool.toString b2)
+            if b1 <> b2 then
+              error ("Different outcome for " ^ src ^ ": " ^ Bool.toString b1 ^ " vs. " ^
+                Bool.toString b2)
+            else if not (null (Synchronized.value loops)) then
+              error ("False loop report for " ^ src ^ ": " ^ commas (Synchronized.value loops))
+            else ()
         | _ => ())
       end;
   in List.app check srcs end;
