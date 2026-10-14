@@ -4,6 +4,7 @@ begin
 
 ML \<open>
 fun use_name (Apply_Inspect.Theorem ((name, _), _)) = name
+  | use_name (Apply_Inspect.Fact thm_name) = "fact " ^ Thm_Name.print thm_name
   | use_name (Apply_Inspect.Assumption (thm_name, _)) = "assumption " ^ Thm_Name.print thm_name
   | use_name (Apply_Inspect.Rule _) = "rule";
 
@@ -361,6 +362,85 @@ lemma
   ML_val \<open>expect_step_loop @{Isar.state} "(fast intro: step)" "classical"
     ["assumption local.step"]\<close>
   oops
+
+
+text \<open>Local facts of the proof context are reported by name, not by the theorems behind
+  them.\<close>
+
+lemma "rev (rev xs) = xs \<and> xs = (ys::nat list)"
+proof -
+  have c: "rev (rev xs) = xs" by simp
+  note e = c[symmetric]
+  have "rev (rev xs) = xs \<and> rev (rev xs) = xs \<and> xs = ys"
+    ML_val \<open>
+      let
+        val src = "(rule conjI, rule c, rule conjI, fail)";
+        val (_, uses) = inspect_test @{Isar.state} src;
+        val every = count_uses true @{Isar.state} "(rule conjI, rule c, rule conjI, rule c, fail)"
+          "fact local.c";
+      in
+        if not (member (op =) uses "fact local.c") then error ("Missing fact c: " ^ commas uses)
+        else if member (op =) uses "List.rev_rev_ident" then
+          error ("Theorem behind fact c reported: " ^ commas uses)
+        else if every <> 2 then error ("Bad count: " ^ string_of_int every)
+        else ()
+      end\<close>
+    oops
+
+lemma "Q 0"
+proof -
+  have step: "\<And>n. Q (Suc n) \<Longrightarrow> Q n" by (rule Q_step)
+  show "Q 0"
+    ML_val \<open>expect_step_loop @{Isar.state} "(fast intro: step)" "classical"
+      ["fact local.step"]\<close>
+    oops
+
+
+text \<open>Reported uses can be filtered with find_theorems criteria.\<close>
+
+ML \<open>
+fun filtered_uses state src criteria =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
+    val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+    val {uses, ...} = Apply_Inspect.inspect params text proof_state;
+    val printed =
+      Apply_Inspect.use_filter proof_state (Find_Theorems.read_query Position.none criteria);
+  in map use_name (filter printed uses) end;
+\<close>
+
+lemma
+  assumes a: "P x"
+  shows "x \<noteq> 0 \<and> length (xs @ ys) = length xs + length ys \<and> xs = ys"
+proof -
+  have c: "rev (rev xs) = xs" by simp
+  show ?thesis
+    ML_val \<open>
+      let
+        val src =
+          "(rule conjI, rule P_nonzero, rule a, rule conjI, simp, subst c[symmetric], fail)";
+        fun check criteria expected =
+          let val uses = filtered_uses @{Isar.state} src criteria in
+            if eq_set (op =) (uses, expected) then ()
+            else
+              error ("Filter " ^ quote criteria ^ ": " ^ commas uses ^ "; all: " ^
+                commas (#2 (inspect_test @{Isar.state} src)))
+          end;
+      in
+        check "name: length_append" ["List.length_append"];
+        check "name: P_nonzero" ["Apply_Inspect_Test.P_nonzero"];
+        check "name: local.a" ["assumption local.a"];
+        check "name: local.c" ["fact local.c"];
+        check "\"_ \<and> _\" name: conjI" ["HOL.conjI"];
+        check "-name: HOL -name: Pure -name: Nat -name: List -name: Groups"
+          ["Apply_Inspect_Test.P_nonzero", "assumption local.a", "fact local.c"]
+      end\<close>
+    oops
+
+lemma "length (xs @ ys) = length xs + length ys"
+  apply_inspect [name: length_append] simp
+  done
 
 
 text \<open>Instrumentation does not change whether a method succeeds.\<close>

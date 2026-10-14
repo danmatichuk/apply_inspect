@@ -18,6 +18,7 @@ sig
   val every_use: bool Config.T
   datatype use =
     Theorem of Thm_Name.P |
+    Fact of Thm_Name.T |
     Assumption of Thm_Name.T * term |
     Rule of thm
   val pretty_use: Proof.context -> use -> Pretty.T
@@ -27,7 +28,9 @@ sig
     on_loop: string -> use list -> unit}
   val inspect: params -> Method.text -> Proof.state -> {succeeded: bool, uses: use list}
   val pretty_uses: Proof.context -> use list -> Pretty.T
-  val apply_inspect: Method.text_range -> Proof.state -> Proof.state Seq.result Seq.seq
+  val use_filter: Proof.state -> (bool * string Find_Theorems.criterion) list -> use -> bool
+  val apply_inspect: (bool * string Find_Theorems.criterion) list option -> Method.text_range ->
+    Proof.state -> Proof.state Seq.result Seq.seq
 end;
 
 structure Apply_Inspect: APPLY_INSPECT =
@@ -42,23 +45,67 @@ val every_use =
 
 datatype use =
   Theorem of Thm_Name.P |  (*global theorem*)
+  Fact of Thm_Name.T |  (*local fact of the proof context, e.g. result of "have"*)
   Assumption of Thm_Name.T * term |  (*assumption of the proof context, possibly unnamed*)
   Rule of thm;  (*other rule, e.g. premise of a subgoal*)
 
 fun pretty_use ctxt (Theorem (thm_name, _)) = Global_Theory.pretty_thm_name ctxt thm_name
+  | pretty_use ctxt (Fact thm_name) =
+      Pretty.block [Pretty.str "fact ", Proof_Context.pretty_thm_name ctxt thm_name]
   | pretty_use ctxt (Assumption (thm_name, prop)) =
       Pretty.block [Pretty.str "assumption ",
         if Thm_Name.is_empty thm_name then Pretty.quote (Syntax.pretty_term ctxt prop)
         else Proof_Context.pretty_thm_name ctxt thm_name]
   | pretty_use ctxt (Rule thm) = Pretty.block [Pretty.str "rule ", Thm.pretty_thm ctxt thm];
 
+(*named local facts of a proof context, without the ones that are also global*)
+fun local_facts ctxt =
+  Facts.dest_static false [Global_Theory.facts_of (Proof_Context.theory_of ctxt)]
+    (Proof_Context.facts_of ctxt)
+  |> filter_out (fn (name, _) => Long_Name.base_name name = "this")
+  |> maps Thm_Name.make_list;
+
+(*prefer facts that consist of a single theorem*)
+fun prefer_single (thm_name: Thm_Name.T) (thm_name': Thm_Name.T) =
+  if #2 thm_name = 0 andalso #2 thm_name' <> 0 then thm_name else thm_name';
+
+(*local facts of a proof context, as the serials of their own (unnamed) dependency nodes, e.g.
+  from the closed derivation of "have", with the serials of the other dependency nodes that
+  come with them (e.g. Pure.protectD)*)
+fun fact_serials ctxt =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val lookup = Global_Theory.lookup_thm_id thy;
+    (*unnamed nodes, without proofs of sort constraints*)
+    fun own_nodes thm =
+      (case try (Thm.thm_deps o Thm.transfer thy) thm of
+        SOME thms =>
+          thms |> filter (fn (i, node) =>
+            is_none (lookup (Proofterm.thm_id (i, node))) andalso
+            not (can Logic.dest_of_class (Proofterm.thm_node_prop node)))
+      | NONE => []);
+    fun add (thm_name, thm) =
+      (case own_nodes thm of
+        [(i, node)] =>
+          let
+            val baggage =
+              map #1 (the_default [] (try (Thm.thm_deps o Thm.transfer thy) thm))
+              |> remove (op =) i;
+            (*the fact states the conclusion of the node, e.g. not a variant introduced by "note"*)
+            val exact =
+              Thm.prop_of thm aconv Logic.strip_imp_concl (Proofterm.thm_node_prop node);
+            val entry = ((thm_name, baggage), exact);
+            fun better (entry' as (_, exact')) =
+              if exact <> exact' then if exact then entry else entry'
+              else if prefer_single thm_name (#1 (#1 entry')) = thm_name then entry else entry';
+          in Inttab.map_default (i, entry) better end
+      | _ => I);
+  in Inttab.build (fold add (local_facts ctxt)) |> Inttab.map (K #1) end;
+
 (*names of the assumptions of a proof context, as local facts*)
 fun assumption_names ctxt =
   let
     val thy = Proof_Context.theory_of ctxt;
-    val local_facts =
-      Facts.dest_static false [Global_Theory.facts_of thy] (Proof_Context.facts_of ctxt)
-      |> filter_out (fn (name, _) => Long_Name.base_name name = "this");
     (*facts that state a single assumption, possibly with its parameters as schematic
       variables*)
     fun add (thm_name, thm) =
@@ -74,9 +121,11 @@ fun assumption_names ctxt =
             if exact orelse try generic () = SOME true then cons (hyp, (thm_name, exact)) else I
           end
       | _ => I);
-    val candidates = fold (fold add o Thm_Name.make_list) local_facts [];
-    (*prefer the assumption itself, and single facts*)
-    fun rank (((_, i), exact)) = (if exact then 0 else 2) + (if i = 0 then 0 else 1);
+    val candidates = fold add (local_facts ctxt) [];
+    (*prefer the assumption itself, single facts, and specific names over "assms"*)
+    fun rank (((name, i), exact)) =
+      (if exact then 0 else 4) + (if i = 0 then 0 else 2) +
+      (if Long_Name.base_name name = "assms" then 1 else 0);
   in
     Termtab.build (fold (fn (hyp, candidate) =>
       Termtab.map_default (hyp, candidate) (fn candidate' =>
@@ -171,21 +220,29 @@ fun add_loop_step eq ({rule, size, follows, output}: ('a, 'b) loop_step)
 
 (* collect dependencies *)
 
-(*named theorems behind dependency nodes, without those already seen;
+(*named theorems and facts behind dependency nodes, without those already seen;
   see also Thm_Deps.thm_deps*)
 fun resolve_deps lookup seen thms =
   let
     fun deps (i, thm_node) tab =
       if Inttab.defined seen i orelse Inttab.defined tab i then tab
       else
-        (case lookup (Proofterm.thm_id (i, thm_node)) of
-          SOME thm_name => Inttab.update (i, SOME thm_name) tab
+        (case lookup (i, thm_node) of
+          SOME u => Inttab.update (i, SOME u) tab
         | NONE =>
             Inttab.update (i, NONE) tab
             |> fold deps (Proofterm.thm_node_thms thm_node));
   in Inttab.build (fold deps thms) end;
 
-fun names_of tab = Inttab.fold_rev (fn (_, SOME thm_name) => cons thm_name | _ => I) tab [];
+fun uses_of tab = Inttab.fold_rev (fn (_, SOME u) => cons u | _ => I) tab [];
+
+(*theorems and facts as keys for comparison*)
+fun use_key (Theorem (thm_name, _)) = SOME (0, thm_name)
+  | use_key (Fact thm_name) = SOME (1, thm_name)
+  | use_key _ = NONE;
+
+fun key_use (0, thm_name) = Theorem (thm_name, Position.none)
+  | key_use (_, thm_name) = Fact thm_name;
 
 (*events reported by the instrumentation:
     observe -- goal state seen at some point,
@@ -208,8 +265,24 @@ type params =
 fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: params) : events =
   let
     val thy = Proof_Context.theory_of ctxt;
-    val lookup = Global_Theory.lookup_thm_id thy;
     val facts = Global_Theory.facts_of thy;
+    val global_lookup = Global_Theory.lookup_thm_id thy;
+    val fact_serials = fact_serials ctxt;
+    fun lookup (i, thm_node) =
+      (case Inttab.lookup fact_serials i of
+        SOME (thm_name, _) => SOME (Fact thm_name)
+      | NONE => Option.map Theorem (global_lookup (Proofterm.thm_id (i, thm_node))));
+
+    (*named nodes that come with a local fact are not reported separately*)
+    fun resolve seen thms =
+      let
+        val tab = resolve_deps lookup seen thms;
+        val baggage =
+          Inttab.fold (fn (i, _) =>
+            (case Inttab.lookup fact_serials i of
+              SOME (_, js) => fold (fn j => if Inttab.defined tab j then cons j else I) js
+            | NONE => I)) tab [];
+      in fold (fn j => Inttab.update (j, NONE)) baggage tab end;
     val assumption_name =
       the_default Thm_Name.empty o Termtab.lookup (assumption_names ctxt);
     fun assumption hyp = Assumption (assumption_name hyp, hyp);
@@ -229,23 +302,23 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
     fun add_hyps hyps =
       rev (Synchronized.change_result hyps_collector (fold add_hyp hyps o pair []));
 
-    fun emit source names hyps =
-      (List.app (on_use source o Theorem) names; List.app (on_use source o assumption) hyps);
+    fun emit source uses hyps =
+      (List.app (on_use source) uses; List.app (on_use source o assumption) hyps);
 
     (*first uses*)
     fun observe source st =
       let
         val names =
           (case try Thm.thm_deps st of
-            SOME thms => add_deps (resolve_deps lookup (Synchronized.value collector) thms)
+            SOME thms => add_deps (resolve (Synchronized.value collector) thms)
           | NONE => []);
         val hyps = add_hyps (context_hyps (Thm.hyps_of st));
       in if every_use then () else emit source names hyps end;
 
     (*every use*)
     fun use source thms hyps =
-      let val tab = resolve_deps lookup Inttab.empty thms
-      in add_deps tab; add_hyps hyps; emit source (names_of tab) hyps end;
+      let val tab = resolve Inttab.empty thms
+      in add_deps tab; add_hyps hyps; emit source (uses_of tab) hyps end;
 
 
     (* steps *)
@@ -258,8 +331,7 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
           (case (try Thm.thm_deps start, try Thm.thm_deps output) of
             (SOME thms, SOME thms') =>
               let
-                val tab =
-                  resolve_deps lookup Inttab.empty (Ord_List.subtract Proofterm.thm_ord thms thms');
+                val tab = resolve Inttab.empty (Ord_List.subtract Proofterm.thm_ord thms thms');
                 val hyps =
                   context_hyps (subtract (op aconv) (Thm.hyps_of start) (Thm.hyps_of output));
               in SOME (tab, hyps) end
@@ -267,13 +339,13 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
         val _ =
           (case used of
             SOME (tab, hyps) =>
-              if every_use then (add_deps tab; add_hyps hyps; emit source (names_of tab) hyps)
+              if every_use then (add_deps tab; add_hyps hyps; emit source (uses_of tab) hyps)
               else observe source output
           | NONE => observe source output);
         val rule =
           (case used of
             SOME (tab, hyps) =>
-              (sort_distinct Thm_Name.ord (map #1 (names_of tab)),
+              (sort_distinct (prod_ord int_ord Thm_Name.ord) (map_filter use_key (uses_of tab)),
                 sort_distinct Term_Ord.fast_term_ord hyps)
           | NONE => ([], []));
         val loop_step =
@@ -295,10 +367,7 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
               (case distinct (op aconv) (maps #2 rules) of
                 [] => if null names then context_hyps (Thm.hyps_of output) else []
               | hyps => hyps);
-          in
-            on_loop source
-              (map (fn name => Theorem (name, Position.none)) names @ map assumption hyps)
-          end)
+          in on_loop source (map key_use names @ map assumption hyps) end)
       end;
 
 
@@ -313,7 +382,13 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
           [hyp] =>
             if hyp aconv Thm.prop_of rule andalso Termtab.defined context_assms hyp
             then assumption hyp else Rule rule
-        | _ => Rule rule);
+        | _ =>
+            (case try (Thm.thm_deps o Thm.transfer thy) rule of
+              SOME thms =>
+                (case get_first (Inttab.lookup fact_serials o #1) thms of
+                  SOME (thm_name, _) => Fact thm_name
+                | NONE => Rule rule)
+            | NONE => Rule rule));
 
     fun rewrite {instance, rule, name, redex, result} =
       let
@@ -336,7 +411,7 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
 
 fun collected_uses ctxt collector hyps_collector =
   let val name = the_default Thm_Name.empty o Termtab.lookup (assumption_names ctxt) in
-    map Theorem (names_of (Synchronized.value collector)) @
+    uses_of (Synchronized.value collector) @
       map (fn hyp => Assumption (name hyp, hyp)) (Termtab.keys (Synchronized.value hyps_collector))
   end;
 
@@ -450,14 +525,40 @@ fun pretty_uses ctxt uses =
   end;
 
 
-(* command *)
+(* filter *)
 
-fun apply_inspect (text, range as (pos, _)) state =
+(*uses that are named facts meeting the given find_theorems criteria*)
+fun use_filter state criteria =
   let
     val ctxt = Proof.context_of state;
+    val goal = try (#goal o Proof.simple_goal) state;
+    (*without a limit, find_theorems still truncates to find_theorems_limit*)
+    val unlimited = SOME (length (Find_Theorems.all_facts_of ctxt));
+    val (_, found) = Find_Theorems.find_theorems_cmd ctxt goal unlimited false criteria;
+    val names = Thm_Name.Set.make (map #1 found);
+    fun named thm_name = Thm_Name.Set.member names thm_name;
+  in
+    fn Theorem (thm_name, _) => named thm_name
+     | Fact thm_name => named thm_name
+     | Assumption (thm_name, _) => named thm_name
+     | Rule _ => false
+  end;
+
+
+(* command *)
+
+fun apply_inspect criteria (text, range as (pos, _)) state =
+  let
+    val ctxt = Proof.context_of state;
+    val printed =
+      (case criteria of
+        SOME criteria => use_filter state criteria
+      | NONE => K true);
     fun on_use source u =
-      writeln (Pretty.string_of (Pretty.block [Pretty.str ("used (" ^ source ^ "): "),
-        pretty_use ctxt u]));
+      if printed u then
+        writeln (Pretty.string_of (Pretty.block [Pretty.str ("used (" ^ source ^ "): "),
+          pretty_use ctxt u]))
+      else ();
     fun on_loop source rules =
       let
         val what =
@@ -477,15 +578,19 @@ fun apply_inspect (text, range as (pos, _)) state =
     (case run params text state of
       (Exn.Res true, _) => Proof.apply (text, range) state
     | (result, uses) =>
-        (Pretty.writeln (pretty_uses ctxt uses);
+        (Pretty.writeln (pretty_uses ctxt (filter printed uses));
          (case result of
            Exn.Exn exn => Exn.reraise exn
          | Exn.Res _ => Seq.single (Proof_Display.method_error "" pos (Proof.raw_goal state)))))
   end;
 
+val criteria =
+  Scan.option (Parse.$$$ "[" |-- Parse.!!! (Find_Theorems.query_parser --| Parse.$$$ "]"));
+
 val _ =
   Outer_Syntax.command \<^command_keyword>\<open>apply_inspect\<close>
     "initial goal refinement step (unstructured), reporting theorems used if it fails"
-    (Method.parse >> (fn m => (Method.report m; Toplevel.proofs (apply_inspect m))));
+    (criteria -- Method.parse >> (fn (crit, m) =>
+      (Method.report m; Toplevel.proofs (apply_inspect crit m))));
 
 end;
