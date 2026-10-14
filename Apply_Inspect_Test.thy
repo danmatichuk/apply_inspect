@@ -9,9 +9,19 @@ fun inspect_test state src =
     val proof_state = Toplevel.proof_of state;
     val ctxt = Proof.context_of proof_state;
     val (text, _) = Method.read_closure_input ctxt (Input.string src);
-    val {succeeded, deps} = Apply_Inspect.inspect (K ()) text proof_state;
+    val {succeeded, deps} = Apply_Inspect.inspect {every_use = false, on_use = K (K ()), on_loop = K ()} text proof_state;
     val _ = Pretty.writeln (Apply_Inspect.pretty_deps ctxt deps);
   in (succeeded, map (#1 o #1) deps) end;
+
+(*number of times each theorem is reported, in the given mode*)
+fun count_uses every_use state src =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
+    val used = Synchronized.var "used" [];
+    fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+    val _ = Apply_Inspect.inspect {every_use = every_use, on_use = on_use, on_loop = K ()} text proof_state;
+  in fn name => length (filter (equal name) (Synchronized.value used)) end;
 
 fun expect_failed_with state src names =
   let val (succeeded, deps) = inspect_test state src in
@@ -75,9 +85,10 @@ lemma "Q 0"
       val (text, _) =
         Method.read_closure_input (Proof.context_of state) (Input.string "(fast intro: Q_step)");
       val used = Synchronized.var "used" [];
-      fun on_use (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+      fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+      val params = {every_use = false, on_use = on_use, on_loop = K ()};
       val _ =
-        (Timeout.apply (seconds 2.0) (Apply_Inspect.inspect on_use text) state;
+        (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
           error "Method terminated")
         handle Timeout.TIMEOUT _ => ();
     in
@@ -98,9 +109,10 @@ lemma "f 0 = 1"
       val (text, _) =
         Method.read_closure_input (Proof.context_of state) (Input.string "(simp add: f_g g_f)");
       val used = Synchronized.var "used" [];
-      fun on_use (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+      fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+      val params = {every_use = false, on_use = on_use, on_loop = K ()};
       val _ =
-        (Timeout.apply (seconds 2.0) (Apply_Inspect.inspect on_use text) state;
+        (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
           error "Method terminated")
         handle Timeout.TIMEOUT _ => ();
     in
@@ -143,6 +155,110 @@ proof -
 qed
 
 end
+
+
+text \<open>Every use of a theorem can be reported, not just the first one.\<close>
+
+lemma "((xs::nat list) = ys \<and> ys = zs) \<and> zs = xs"
+  ML_val \<open>
+    let
+      val src = "((rule conjI, fail) | (rule conjI, fail))";
+      val first = count_uses false @{Isar.state} src "HOL.conjI";
+      val every = count_uses true @{Isar.state} src "HOL.conjI";
+    in
+      if first = 1 andalso every = 2 then ()
+      else error ("Bad counts: " ^ string_of_int first ^ ", " ^ string_of_int every)
+    end\<close>
+  oops
+
+lemma "rev (rev (rev (rev xs))) = ys"
+  ML_val \<open>
+    let
+      val src = "(simp only: rev_rev_ident, fail)";
+      val first = count_uses false @{Isar.state} src "List.rev_rev_ident";
+      val every = count_uses true @{Isar.state} src "List.rev_rev_ident";
+    in
+      if first = 1 andalso every >= 2 then ()
+      else error ("Bad counts: " ^ string_of_int first ^ ", " ^ string_of_int every)
+    end\<close>
+  oops
+
+
+text \<open>Suspected simplifier loops are reported while the method runs.\<close>
+
+ML \<open>
+(*rules reported as looping before the timeout, or NONE if the method terminated*)
+fun loop_rules state src =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
+    val loops = Synchronized.var "loops" [];
+    fun on_loop rules = Synchronized.change loops (cons (map (#1 o #1) rules));
+    val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
+  in
+    (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) proof_state; NONE)
+      handle Timeout.TIMEOUT _ => SOME (Synchronized.value loops)
+  end;
+
+fun expect_loop state src names =
+  (case loop_rules state src of
+    NONE => error "Method terminated"
+  | SOME [] => error "No loop reported"
+  | SOME (rules :: _) =>
+      if eq_set (op =) (rules, names) then ()
+      else error ("Bad loop report: " ^ commas (map quote rules)));
+\<close>
+
+lemma "f 0 = 1"
+  ML_val \<open>expect_loop @{Isar.state} "(simp add: f_g g_f)"
+    ["Apply_Inspect_Test.f_g", "Apply_Inspect_Test.g_f"]\<close>
+  oops
+
+axiomatization k :: "nat \<Rightarrow> nat" where k_Suc: "k n = k (Suc n)"
+
+lemma "k 0 = 1"
+  ML_val \<open>expect_loop @{Isar.state} "(simp add: k_Suc)" ["Apply_Inspect_Test.k_Suc"]\<close>
+  oops
+
+lemma "f x = g x \<Longrightarrow> g x = f x \<Longrightarrow> f x = 0"
+  ML_val \<open>expect_loop @{Isar.state} "(simp (no_asm_simp))" ["??.unknown"]\<close>
+  oops
+
+ML \<open>
+fun expect_no_loop state src =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
+    val loops = Synchronized.var "loops" [];
+    fun on_loop rules = Synchronized.change loops (cons (map (#1 o #1) rules));
+    val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
+    val {succeeded, ...} = Apply_Inspect.inspect params text proof_state;
+  in
+    if not succeeded then error "Method failed"
+    else if not (null (Synchronized.value loops)) then
+      error ("False loop report: " ^ commas (map commas (Synchronized.value loops)))
+    else ()
+  end;
+\<close>
+
+lemma "length [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24] = 24 \<and>
+    map Suc [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24] \<noteq> []"
+  ML_val \<open>expect_no_loop @{Isar.state} "simp"\<close>
+  oops
+
+
+lemma "(2::nat) ^ 20 = 1048576"
+  ML_val \<open>expect_no_loop @{Isar.state} "simp"\<close>
+  oops
+
+lemma "sum_list [1..<30] = (435::nat)"
+  ML_val \<open>expect_no_loop @{Isar.state} "(simp add: upt_rec)"\<close>
+  oops
+
+lemma "rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev
+    (rev (rev (rev (rev (rev (rev xs))))))))))))))))))))))) = xs"
+  ML_val \<open>expect_no_loop @{Isar.state} "simp"\<close>
+  oops
 
 
 text \<open>Dependencies of the goal state itself are not reported.\<close>
