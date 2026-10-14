@@ -700,4 +700,39 @@ ML_val \<open>
     | _ => error "Method failed")
   end\<close>
 
+text \<open>
+  An unfinished proof of an earlier theorem (e.g. a forked proof that is stuck) delays the
+  inspection of later goals by at most the join timeout per step, and its dependencies are left
+  out. The proof is simulated by a fact with a promise that is fulfilled only afterwards.
+\<close>
+
+ML_val \<open>
+  let
+    val stuck = Future.promise I;
+    val stuck_thm = Thm.future stuck \<^cprop>\<open>\<forall>n::nat. n + 1 < n\<close>;
+    val (_, thy) = Global_Theory.store_thm (\<^binding>\<open>stuck_fact\<close>, stuck_thm) \<^theory>;
+    val ctxt = Proof_Context.init_global thy;
+    fun check src prop =
+      let
+        val state = Proof.theorem NONE (K I) [[(prop, [])]] ctxt;
+        val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+        val start = Time.now ();
+        val result =
+          Timeout.apply (seconds 20.0)
+            (Apply_Inspect.inspect params (read_text (Proof.context_of state) src)) state;
+        val time = Time.now () - start;
+      in
+        (case result of
+          {succeeded = true, error = NONE, ...} =>
+            if time > seconds 5.0 then error (src ^ ": took " ^ Time.message time) else ()
+        | {error = SOME msg, ...} => error (src ^ ": " ^ msg)
+        | _ => error (src ^ ": method failed"))
+      end;
+    val result =
+      Exn.capture (fn () =>
+        (check "simp" \<^prop>\<open>(n::nat) < n + 2\<close>;
+         check "(rule stuck_fact)" \<^prop>\<open>\<forall>n::nat. n + 1 < n\<close>)) ();
+    val _ = Future.fulfill_result stuck (Exn.Exn (Fail "Test finished"));
+  in Exn.release result end\<close>
+
 end

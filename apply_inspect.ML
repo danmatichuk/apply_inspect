@@ -16,6 +16,7 @@ if the method succeeds, it is run again without instrumentation.
 signature APPLY_INSPECT =
 sig
   val every_use: bool Config.T
+  val join_timeout: real Config.T
   datatype use =
     Theorem of Thm_Name.P |
     Fact of Thm_Name.T |
@@ -42,6 +43,11 @@ struct
 (*report every use of a theorem, not just the first one*)
 val every_use =
   Attrib.setup_config_bool \<^binding>\<open>apply_inspect_every_use\<close> (K false);
+
+(*time limit (in seconds, 0 for none) for waiting on proofs of other theorems, which may still
+  be running in a forked task, or never finish: their dependencies are left out*)
+val join_timeout =
+  Attrib.setup_config_real \<^binding>\<open>apply_inspect_join_timeout\<close> (K 0.1);
 
 
 (* uses *)
@@ -135,46 +141,59 @@ fun local_facts ctxt =
 fun prefer_single (thm_name: Thm_Name.T) (thm_name': Thm_Name.T) =
   if #2 thm_name = 0 andalso #2 thm_name' <> 0 then thm_name else thm_name';
 
-(*Global_Theory.lookup_thm_id builds the name table of a theory from the derivations of all of
-  its facts, which joins their proofs: a single failed proof makes every lookup in that theory
-  fail. This happens in PIDE, where a failed proof of an earlier theorem does not stop the
-  theory. Such theories get a table of their own here, without the facts whose proofs fail.*)
-fun lookup_thm_id thy =
+(* waiting for proofs of other theorems *)
+
+(*f x in a thread of its own, which is not a worker of the future scheduler: it only waits for
+  forked proofs and never runs them itself, so that interrupting it after the timeout does not
+  interrupt (and cancel) them*)
+fun join_limited timeout f x =
   let
-    val global_lookup = Global_Theory.lookup_thm_id thy;
-    val theories =
-      Symtab.build (Theory.nodes_of thy |> fold (fn thy' =>
-        Symtab.update (Context.theory_long_name thy', thy')));
-    fun make_thm_names thy' =
-      Global_Theory.dest_thms true (Theory.parents_of thy') thy'
-      |> fold (fn (thm_name, thm) =>
-          (case try Thm.derivation_id (Thm.transfer thy' thm) of
-            SOME (SOME {serial, ...}) => Inttab.default (serial, thm_name)
-          | _ => I))
-      |> (fn f => f Inttab.empty);
-    val own_tables = Synchronized.var "apply_inspect_thm_names" Symtab.empty;
-    fun own_table theory_name =
-      Synchronized.change_result own_tables (fn tabs =>
-        (case Symtab.lookup tabs theory_name of
-          SOME tab => (tab, tabs)
-        | NONE =>
-            let
-              val tab =
-                Lazy.lazy (fn () =>
-                  (case Symtab.lookup theories theory_name of
-                    SOME thy' => make_thm_names thy'
-                  | NONE => Inttab.empty));
-            in (tab, Symtab.update (theory_name, tab) tabs) end));
-    fun own_lookup (thm_id: Proofterm.thm_id) =
-      Inttab.lookup (Lazy.force (own_table (#theory_name thm_id))) (#serial thm_id);
+    val result = Single_Assignment.var "apply_inspect_join";
+    val thread =
+      Isabelle_Thread.fork
+        (Isabelle_Thread.params "apply_inspect_join" |> Isabelle_Thread.interrupts)
+        (fn () => Single_Assignment.assign result (Exn.capture0 f x));
+    fun stop () = Isabelle_Thread.interrupt_thread thread;
   in
-    fn thm_id =>
-      if Symtab.defined (Synchronized.value own_tables) (#theory_name thm_id)
-      then own_lookup thm_id
-      else
-        (case Exn.result global_lookup thm_id of
-          Exn.Res res => res
-        | Exn.Exn _ => own_lookup thm_id)
+    (case Exn.capture0 (Timeout.apply timeout Single_Assignment.await) result of
+      Exn.Res (Exn.Res y) => SOME y
+    | Exn.Res (Exn.Exn _) => NONE
+    | Exn.Exn (Timeout.TIMEOUT _) => (stop (); NONE)
+    | Exn.Exn exn => (stop (); Exn.reraise exn))
+  end;
+
+(*dependencies of a theorem, unless they wait for unfinished proofs of other theorems*)
+fun thm_deps_limited ctxt =
+  join_limited (seconds (Config.get ctxt join_timeout)) Thm.thm_deps;
+
+(*dependencies of a node whose proof is finished, without waiting for it*)
+fun finished_node_thms node =
+  if Future.is_finished (Proofterm.thm_node_body node)
+  then the_default [] (try Proofterm.thm_node_thms node)
+  else [];
+
+(*name of a node, if it names a global fact with the same statement: unlike
+  Global_Theory.lookup_thm_id, this does not need the derivations of all facts of the theory,
+  which wait for their proofs (in PIDE, failed or unfinished proofs do not stop the theory)*)
+fun lookup_thm_node ctxt =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val facts = Global_Theory.facts_of thy;
+    fun statement thm = #2 (Logic.unconstrainT (Thm.shyps_of thm) (Thm.prop_of thm));
+  in
+    fn node =>
+      let val thm_name as (name, i) = Proofterm.thm_node_name node in
+        if Thm_Name.is_empty thm_name then NONE
+        else
+          (case Facts.lookup (Context.Theory thy) facts name of
+            SOME {thms, ...} =>
+              (case if i = 0 then try the_single thms else try (nth thms) (i - 1) of
+                SOME thm =>
+                  if statement thm aconv Proofterm.thm_node_prop node
+                  then SOME (thm_name, Position.none) else NONE
+              | NONE => NONE)
+          | NONE => NONE)
+      end
   end;
 
 (*local facts of a proof context, as the serials of their own (unnamed) dependency nodes, e.g.
@@ -184,29 +203,30 @@ fun fact_serials ctxt lookup =
   let
     val thy = Proof_Context.theory_of ctxt;
     (*unnamed nodes, without proofs of sort constraints*)
-    fun own_nodes thm =
-      (case try (Thm.thm_deps o Thm.transfer thy) thm of
-        SOME thms =>
-          thms |> filter (fn (i, node) =>
-            is_none (lookup (Proofterm.thm_id (i, node))) andalso
-            not (can Logic.dest_of_class (Proofterm.thm_node_prop node)))
-      | NONE => []);
+    fun own_nodes thms =
+      thms |> filter (fn (i, node) =>
+        is_none (lookup node) andalso
+        not (can Logic.dest_of_class (Proofterm.thm_node_prop node)));
     fun add (thm_name, thm) =
-      (case own_nodes thm of
-        [(i, node)] =>
-          let
-            val baggage =
-              map #1 (the_default [] (try (Thm.thm_deps o Thm.transfer thy) thm))
-              |> remove (op =) i;
-            (*the fact states the conclusion of the node, e.g. not a variant introduced by "note"*)
-            val exact =
-              Thm.prop_of thm aconv Logic.strip_imp_concl (Proofterm.thm_node_prop node);
-            val entry = ((thm_name, baggage), exact);
-            fun better (entry' as (_, exact')) =
-              if exact <> exact' then if exact then entry else entry'
-              else if prefer_single thm_name (#1 (#1 entry')) = thm_name then entry else entry';
-          in Inttab.map_default (i, entry) better end
-      | _ => I);
+      let
+        val deps =
+          the_default [] (try (Thm.transfer thy) thm |> Option.mapPartial (thm_deps_limited ctxt));
+      in
+        (case own_nodes deps of
+          [(i, node)] =>
+            let
+              val baggage = remove (op =) i (map #1 deps);
+              (*the fact states the conclusion of the node, e.g. not a variant introduced by
+                "note"*)
+              val exact =
+                Thm.prop_of thm aconv Logic.strip_imp_concl (Proofterm.thm_node_prop node);
+              val entry = ((thm_name, baggage), exact);
+              fun better (entry' as (_, exact')) =
+                if exact <> exact' then if exact then entry else entry'
+                else if prefer_single thm_name (#1 (#1 entry')) = thm_name then entry else entry';
+            in Inttab.map_default (i, entry) better end
+        | _ => I)
+      end;
   in Inttab.build (fold add (local_facts ctxt)) |> Inttab.map (K #1) end;
 
 (*names of the assumptions of a proof context, as local facts*)
@@ -348,7 +368,7 @@ fun resolve_deps lookup seen thms =
           SOME u => Inttab.update (i, SOME u) tab
         | NONE =>
             Inttab.update (i, NONE) tab
-            |> fold deps (Proofterm.thm_node_thms thm_node));
+            |> fold deps (finished_node_thms thm_node));
   in Inttab.build (fold deps thms) end;
 
 fun uses_of tab = Inttab.fold_rev (fn (_, SOME u) => cons u | _ => I) tab [];
@@ -383,12 +403,13 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
   let
     val thy = Proof_Context.theory_of ctxt;
     val facts = Global_Theory.facts_of thy;
-    val global_lookup = lookup_thm_id thy;
-    val fact_serials = fact_serials ctxt global_lookup;
+    val thm_deps = thm_deps_limited ctxt;
+    val lookup_node = lookup_thm_node ctxt;
+    val fact_serials = fact_serials ctxt lookup_node;
     fun lookup (i, thm_node) =
       (case Inttab.lookup fact_serials i of
         SOME (thm_name, _) => SOME (Fact thm_name)
-      | NONE => Option.map Theorem (global_lookup (Proofterm.thm_id (i, thm_node))));
+      | NONE => Option.map Theorem (lookup_node thm_node));
 
     (*named nodes that come with a local fact are not reported separately*)
     fun resolve seen thms =
@@ -426,7 +447,7 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
     fun observe source st =
       let
         val names =
-          (case try Thm.thm_deps st of
+          (case thm_deps st of
             SOME thms => add_deps (resolve (Synchronized.value collector) thms)
           | NONE => []);
         val hyps = add_hyps (context_hyps (Thm.hyps_of st));
@@ -445,7 +466,7 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
     fun step source {input, start, output, size} =
       let
         val used =
-          (case (try Thm.thm_deps start, try Thm.thm_deps output) of
+          (case (thm_deps start, thm_deps output) of
             (SOME thms, SOME thms') =>
               let
                 val tab = resolve Inttab.empty (Ord_List.subtract Proofterm.thm_ord thms thms');
@@ -500,7 +521,7 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
             if hyp aconv Thm.prop_of rule andalso Termtab.defined context_assms hyp
             then assumption hyp else Rule rule
         | _ =>
-            (case try (Thm.thm_deps o Thm.transfer thy) rule of
+            (case try (Thm.transfer thy) rule |> Option.mapPartial thm_deps of
               SOME thms =>
                 (case get_first (Inttab.lookup fact_serials o #1) thms of
                   SOME (thm_name, _) => Fact thm_name
@@ -513,7 +534,7 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
           if every_use andalso Facts.defined facts (#1 name) then
             (observe "simp" instance; on_use "simp" (Theorem (name, Position.none)))
           else if every_use then
-            use "simp" (the_default [] (try Thm.thm_deps instance))
+            use "simp" (the_default [] (thm_deps instance))
               (context_hyps (Thm.hyps_of instance))
           else observe "simp" instance;
         val loop_step =
