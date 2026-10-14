@@ -16,12 +16,17 @@ if the method succeeds, it is run again without instrumentation.
 signature APPLY_INSPECT =
 sig
   val every_use: bool Config.T
+  datatype use =
+    Theorem of Thm_Name.P |
+    Assumption of Thm_Name.T * term |
+    Rule of thm
+  val pretty_use: Proof.context -> use -> Pretty.T
   type params =
    {every_use: bool,
-    on_use: string -> Thm_Name.P -> unit,
-    on_loop: string -> (Thm_Name.T * thm) list -> unit}
-  val inspect: params -> Method.text -> Proof.state -> {succeeded: bool, deps: Thm_Name.P list}
-  val pretty_deps: Proof.context -> Thm_Name.P list -> Pretty.T
+    on_use: string -> use -> unit,
+    on_loop: string -> use list -> unit}
+  val inspect: params -> Method.text -> Proof.state -> {succeeded: bool, uses: use list}
+  val pretty_uses: Proof.context -> use list -> Pretty.T
   val apply_inspect: Method.text_range -> Proof.state -> Proof.state Seq.result Seq.seq
 end;
 
@@ -33,17 +38,73 @@ val every_use =
   Attrib.setup_config_bool \<^binding>\<open>apply_inspect_every_use\<close> (K false);
 
 
+(* uses *)
+
+datatype use =
+  Theorem of Thm_Name.P |  (*global theorem*)
+  Assumption of Thm_Name.T * term |  (*assumption of the proof context, possibly unnamed*)
+  Rule of thm;  (*other rule, e.g. premise of a subgoal*)
+
+fun pretty_use ctxt (Theorem (thm_name, _)) = Global_Theory.pretty_thm_name ctxt thm_name
+  | pretty_use ctxt (Assumption (thm_name, prop)) =
+      Pretty.block [Pretty.str "assumption ",
+        if Thm_Name.is_empty thm_name then Pretty.quote (Syntax.pretty_term ctxt prop)
+        else Proof_Context.pretty_thm_name ctxt thm_name]
+  | pretty_use ctxt (Rule thm) = Pretty.block [Pretty.str "rule ", Thm.pretty_thm ctxt thm];
+
+(*names of the assumptions of a proof context, as local facts*)
+fun assumption_names ctxt =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val local_facts =
+      Facts.dest_static false [Global_Theory.facts_of thy] (Proof_Context.facts_of ctxt)
+      |> filter_out (fn (name, _) => Long_Name.base_name name = "this");
+    (*facts that state a single assumption, possibly with its parameters as schematic
+      variables*)
+    fun add (thm_name, thm) =
+      (case Thm.chyps_of thm of
+        [chyp] =>
+          let
+            val hyp = Thm.term_of chyp;
+            val exact = hyp aconv Thm.prop_of thm;
+            fun generic () =
+              Thm.equiv_thm thy
+                (Thm.forall_elim_vars (Thm.maxidx_of thm + 1) (Thm.assume chyp), thm);
+          in
+            if exact orelse try generic () = SOME true then cons (hyp, (thm_name, exact)) else I
+          end
+      | _ => I);
+    val candidates = fold (fold add o Thm_Name.make_list) local_facts [];
+    (*prefer the assumption itself, and single facts*)
+    fun rank (((_, i), exact)) = (if exact then 0 else 2) + (if i = 0 then 0 else 1);
+  in
+    Termtab.build (fold (fn (hyp, candidate) =>
+      Termtab.map_default (hyp, candidate) (fn candidate' =>
+        if rank candidate < rank candidate' then candidate else candidate')) candidates)
+    |> Termtab.map (K #1)
+  end;
+
+
 (* fresh goal state without dependencies *)
 
 val (_, fresh_state) =
   Context.>>> (Context.map_theory_result (Thm.add_oracle (\<^binding>\<open>apply_inspect\<close>, I)));
 
-(*copy of the goal state without dependencies, unless the copy would differ in hypotheses or
-  flex-flex constraints (which would affect the behaviour of tactics)*)
+(*copy of the goal state without dependencies, with the same hypotheses, unless the copy would
+  differ in flex-flex constraints or sort hypotheses (which would affect the behaviour of
+  tactics)*)
 fun refresh_state st =
-  (case try fresh_state (Thm.cprop_of st) of
-    SOME st' => if Thm.eq_thm (st, st') then st' else st
-  | NONE => st);
+  let
+    fun copy () =
+      let val hyps = Thm.chyps_of st in
+        Drule.implies_elim_list (fresh_state (Drule.list_implies (hyps, Thm.cprop_of st)))
+          (map Thm.assume hyps)
+      end;
+  in
+    (case try copy () of
+      SOME st' => if Thm.eq_thm (st, st') then st' else st
+    | NONE => st)
+  end;
 
 
 (* loop detection *)
@@ -139,51 +200,82 @@ type events =
 
 type params =
  {every_use: bool,
-  on_use: string -> Thm_Name.P -> unit,
-  on_loop: string -> (Thm_Name.T * thm) list -> unit};
+  on_use: string -> use -> unit,
+  on_loop: string -> use list -> unit};
 
-(*collector: serial of each dependency seen so far, with its name if it is a named theorem*)
-fun make_events thy collector ({every_use, on_use, on_loop}: params) : events =
+(*collector: serial of each dependency seen so far, with its name if it is a named theorem;
+  hyps_collector: hypotheses seen so far*)
+fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: params) : events =
   let
+    val thy = Proof_Context.theory_of ctxt;
     val lookup = Global_Theory.lookup_thm_id thy;
     val facts = Global_Theory.facts_of thy;
+    val assumption_name =
+      the_default Thm_Name.empty o Termtab.lookup (assumption_names ctxt);
+    fun assumption hyp = Assumption (assumption_name hyp, hyp);
+
+    (*hypotheses that are assumptions of the proof context, not e.g. premises of a subgoal
+      that are assumed temporarily by the simplifier*)
+    val context_assms = Termtab.make_set (map Thm.term_of (Assumption.all_assms_of ctxt));
+    val context_hyps = filter (Termtab.defined context_assms);
 
     fun add (i, entry) (names, seen) =
       if Inttab.defined seen i then (names, seen)
       else (the_list entry @ names, Inttab.update (i, entry) seen);
     fun add_deps tab = rev (Synchronized.change_result collector (Inttab.fold add tab o pair []));
+    fun add_hyp hyp (hyps, seen) =
+      if Termtab.defined seen hyp then (hyps, seen)
+      else (hyp :: hyps, Termtab.update (hyp, ()) seen);
+    fun add_hyps hyps =
+      rev (Synchronized.change_result hyps_collector (fold add_hyp hyps o pair []));
 
-    fun observe_deps source thms =
-      let val new = add_deps (resolve_deps lookup (Synchronized.value collector) thms)
-      in if every_use then () else List.app (on_use source) new end;
-    fun use_deps source thms =
+    fun emit source names hyps =
+      (List.app (on_use source o Theorem) names; List.app (on_use source o assumption) hyps);
+
+    (*first uses*)
+    fun observe source st =
+      let
+        val names =
+          (case try Thm.thm_deps st of
+            SOME thms => add_deps (resolve_deps lookup (Synchronized.value collector) thms)
+          | NONE => []);
+        val hyps = add_hyps (context_hyps (Thm.hyps_of st));
+      in if every_use then () else emit source names hyps end;
+
+    (*every use*)
+    fun use source thms hyps =
       let val tab = resolve_deps lookup Inttab.empty thms
-      in add_deps tab; List.app (on_use source) (names_of tab) end;
-
-    fun observe source st = Option.app (observe_deps source) (try Thm.thm_deps st);
+      in add_deps tab; add_hyps hyps; emit source (names_of tab) hyps end;
 
 
     (* steps *)
 
     val step_loops = Synchronized.var "apply_inspect_step_loops" Symtab.empty;
 
-    fun get_thm name = try (Global_Theory.get_thm_name thy) (name, Position.none);
-
     fun step source {input, start, output, size} =
       let
         val used =
           (case (try Thm.thm_deps start, try Thm.thm_deps output) of
             (SOME thms, SOME thms') =>
-              SOME (resolve_deps lookup Inttab.empty
-                (Ord_List.subtract Proofterm.thm_ord thms thms'))
+              let
+                val tab =
+                  resolve_deps lookup Inttab.empty (Ord_List.subtract Proofterm.thm_ord thms thms');
+                val hyps =
+                  context_hyps (subtract (op aconv) (Thm.hyps_of start) (Thm.hyps_of output));
+              in SOME (tab, hyps) end
           | _ => NONE);
         val _ =
           (case used of
-            SOME tab =>
-              if every_use then (add_deps tab; List.app (on_use source) (names_of tab))
+            SOME (tab, hyps) =>
+              if every_use then (add_deps tab; add_hyps hyps; emit source (names_of tab) hyps)
               else observe source output
           | NONE => observe source output);
-        val rule = sort_distinct Thm_Name.ord (map #1 (the_default [] (Option.map names_of used)));
+        val rule =
+          (case used of
+            SOME (tab, hyps) =>
+              (sort_distinct Thm_Name.ord (map #1 (names_of tab)),
+                sort_distinct Term_Ord.fast_term_ord hyps)
+          | NONE => ([], []));
         val loop_step =
           {rule = rule, size = size, output = SOME output,
             follows = fn prev => pointer_eq (prev, input) orelse Thm.eq_thm (prev, input)};
@@ -195,8 +287,18 @@ fun make_events thy collector ({every_use, on_use, on_loop}: params) : events =
             in (new_cycle, Symtab.update (source, state') tab) end);
       in
         new_cycle |> Option.app (fn rules =>
-          on_loop source (map_filter (fn name => Option.map (pair name) (get_thm name))
-            (distinct (op =) (flat rules))))
+          let
+            val names = distinct (op =) (maps #1 rules);
+            (*assumptions are only reported on first use on a branch, so fall back to those
+              that the branch uses*)
+            val hyps =
+              (case distinct (op aconv) (maps #2 rules) of
+                [] => if null names then context_hyps (Thm.hyps_of output) else []
+              | hyps => hyps);
+          in
+            on_loop source
+              (map (fn name => Theorem (name, Position.none)) names @ map assumption hyps)
+          end)
       end;
 
 
@@ -204,12 +306,23 @@ fun make_events thy collector ({every_use, on_use, on_loop}: params) : events =
 
     val rewrite_loops = Synchronized.var "apply_inspect_rewrite_loops" (init_loop_state ());
 
+    fun rule_use (name, rule) =
+      if Facts.defined facts (#1 name) then Theorem (name, Position.none)
+      else
+        (case Thm.hyps_of rule of
+          [hyp] =>
+            if hyp aconv Thm.prop_of rule andalso Termtab.defined context_assms hyp
+            then assumption hyp else Rule rule
+        | _ => Rule rule);
+
     fun rewrite {instance, rule, name, redex, result} =
       let
         val _ =
           if every_use andalso Facts.defined facts (#1 name) then
-            (observe "simp" instance; on_use "simp" (name, Position.none))
-          else if every_use then Option.app (use_deps "simp") (try Thm.thm_deps instance)
+            (observe "simp" instance; on_use "simp" (Theorem (name, Position.none)))
+          else if every_use then
+            use "simp" (the_default [] (try Thm.thm_deps instance))
+              (context_hyps (Thm.hyps_of instance))
           else observe "simp" instance;
         val loop_step =
           {rule = (name, rule), size = size_of_term redex, output = result,
@@ -217,11 +330,15 @@ fun make_events thy collector ({every_use, on_use, on_loop}: params) : events =
       in
         Synchronized.change_result rewrite_loops
           (add_loop_step (Thm.eq_thm_prop o apply2 #2) loop_step)
-        |> Option.app (on_loop "simp")
+        |> Option.app (on_loop "simp" o map rule_use)
       end;
   in {observe = observe, step = step, rewrite = rewrite} end;
 
-fun collected_deps collector = names_of (Synchronized.value collector);
+fun collected_uses ctxt collector hyps_collector =
+  let val name = the_default Thm_Name.empty o Termtab.lookup (assumption_names ctxt) in
+    map Theorem (names_of (Synchronized.value collector)) @
+      map (fn hyp => Assumption (name hyp, hyp)) (Termtab.keys (Synchronized.value hyps_collector))
+  end;
 
 
 (* instrumentation *)
@@ -300,7 +417,8 @@ fun run params text state =
     val {context = goal_ctxt, facts = using, goal} = Proof.raw_goal state;
 
     val collector = Synchronized.var "apply_inspect" Inttab.empty;
-    val events = make_events (Proof_Context.theory_of ctxt) collector params;
+    val hyps_collector = Synchronized.var "apply_inspect_hyps" Termtab.empty;
+    val events = make_events ctxt collector hyps_collector params;
 
     (*the results of the run are discarded, so its contexts may live in a private theory*)
     val thy' = Raw_Simplifier.set_trace_ops (simp_trace_ops events) (Proof_Context.theory_of ctxt);
@@ -313,21 +431,19 @@ fun run params text state =
         |> Seq.filter_results
         |> Seq.pull
         |> is_some) ();
-  in (result, collected_deps collector) end;
+  in (result, collected_uses ctxt collector hyps_collector) end;
 
 fun inspect params text state =
-  let val (result, deps) = run params text state
-  in {succeeded = (case result of Exn.Res b => b | Exn.Exn _ => false), deps = deps} end;
+  let val (result, uses) = run params text state
+  in {succeeded = (case result of Exn.Res b => b | Exn.Exn _ => false), uses = uses} end;
 
-fun pretty_deps ctxt deps =
+fun pretty_uses ctxt uses =
   let
-    val thy = Proof_Context.theory_of ctxt;
-    val extern_fact = Name_Space.extern ctxt (Facts.space_of (Global_Theory.facts_of thy));
     val items =
-      deps
-      |> map (fn (thm_name as (name, _), _) => (extern_fact name, thm_name))
+      uses
+      |> map (fn u => (Pretty.unformatted_string_of (pretty_use ctxt u), u))
       |> sort_by #1
-      |> map (fn (_, thm_name) => Pretty.item [Global_Theory.pretty_thm_name ctxt thm_name]);
+      |> map (fn (_, u) => Pretty.item [pretty_use ctxt u]);
   in
     Pretty.big_list
       ("theorems used in failed method application: " ^ string_of_int (length items)) items
@@ -339,13 +455,9 @@ fun pretty_deps ctxt deps =
 fun apply_inspect (text, range as (pos, _)) state =
   let
     val ctxt = Proof.context_of state;
-    fun on_use source (thm_name, _) =
+    fun on_use source u =
       writeln (Pretty.string_of (Pretty.block [Pretty.str ("used (" ^ source ^ "): "),
-        Global_Theory.pretty_thm_name ctxt thm_name]));
-    fun pretty_rule (name, rule) =
-      if Facts.defined (Global_Theory.facts_of (Proof_Context.theory_of ctxt)) (#1 name)
-      then Global_Theory.pretty_thm_name ctxt name
-      else Thm.pretty_thm ctxt rule;
+        pretty_use ctxt u]));
     fun on_loop source rules =
       let
         val what =
@@ -355,7 +467,7 @@ fun apply_inspect (text, range as (pos, _)) state =
           | _ => "Proof method " ^ quote source);
         val items =
           if null rules then [Pretty.item [Pretty.str "(no named theorems)"]]
-          else map (Pretty.item o single o pretty_rule) rules;
+          else map (Pretty.item o single o pretty_use ctxt) rules;
       in
         warning (Pretty.string_of
           (Pretty.big_list (what ^ " may be looping, repeatedly using:") items))
@@ -364,8 +476,8 @@ fun apply_inspect (text, range as (pos, _)) state =
   in
     (case run params text state of
       (Exn.Res true, _) => Proof.apply (text, range) state
-    | (result, deps) =>
-        (Pretty.writeln (pretty_deps ctxt deps);
+    | (result, uses) =>
+        (Pretty.writeln (pretty_uses ctxt uses);
          (case result of
            Exn.Exn exn => Exn.reraise exn
          | Exn.Res _ => Seq.single (Proof_Display.method_error "" pos (Proof.raw_goal state)))))

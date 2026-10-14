@@ -3,6 +3,10 @@ theory Apply_Inspect_Test
 begin
 
 ML \<open>
+fun use_name (Apply_Inspect.Theorem ((name, _), _)) = name
+  | use_name (Apply_Inspect.Assumption (thm_name, _)) = "assumption " ^ Thm_Name.print thm_name
+  | use_name (Apply_Inspect.Rule _) = "rule";
+
 (*run a method given as source text on the current proof state, without changing it*)
 fun inspect_test state src =
   let
@@ -10,9 +14,9 @@ fun inspect_test state src =
     val ctxt = Proof.context_of proof_state;
     val (text, _) = Method.read_closure_input ctxt (Input.string src);
     val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
-    val {succeeded, deps} = Apply_Inspect.inspect params text proof_state;
-    val _ = Pretty.writeln (Apply_Inspect.pretty_deps ctxt deps);
-  in (succeeded, map (#1 o #1) deps) end;
+    val {succeeded, uses} = Apply_Inspect.inspect params text proof_state;
+    val _ = Pretty.writeln (Apply_Inspect.pretty_uses ctxt uses);
+  in (succeeded, map use_name uses) end;
 
 (*number of times each theorem is reported, in the given mode*)
 fun count_uses every_use state src =
@@ -20,7 +24,7 @@ fun count_uses every_use state src =
     val proof_state = Toplevel.proof_of state;
     val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
     val used = Synchronized.var "used" [];
-    fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+    fun on_use _ u = Synchronized.change used (cons (use_name u));
     val params = {every_use = every_use, on_use = on_use, on_loop = K (K ())};
     val _ = Apply_Inspect.inspect params text proof_state;
   in fn name => length (filter (equal name) (Synchronized.value used)) end;
@@ -87,7 +91,7 @@ lemma "Q 0"
       val (text, _) =
         Method.read_closure_input (Proof.context_of state) (Input.string "(fast intro: Q_step)");
       val used = Synchronized.var "used" [];
-      fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+      fun on_use _ u = Synchronized.change used (cons (use_name u));
       val params = {every_use = false, on_use = on_use, on_loop = K (K ())};
       val _ =
         (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
@@ -111,7 +115,7 @@ lemma "f 0 = 1"
       val (text, _) =
         Method.read_closure_input (Proof.context_of state) (Input.string "(simp add: f_g g_f)");
       val used = Synchronized.var "used" [];
-      fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+      fun on_use _ u = Synchronized.change used (cons (use_name u));
       val params = {every_use = false, on_use = on_use, on_loop = K (K ())};
       val _ =
         (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
@@ -142,7 +146,7 @@ begin
 
 lemma "z = 1"
   ML_val \<open>expect_failed_with @{Isar.state} "(simp add: z f_g, fail)"
-    ["Apply_Inspect_Test.f_g"]\<close>
+    ["Apply_Inspect_Test.f_g", "assumption local.z"]\<close>
   oops
 
 lemma "z = g 0 \<and> rev (rev xs) = xs"
@@ -184,7 +188,7 @@ lemma "Q 0"
       val (text, _) =
         Method.read_closure_input (Proof.context_of state) (Input.string "(fast intro: Q_step)");
       val used = Synchronized.var "used" [];
-      fun on_use _ (thm_name, _) = Synchronized.change used (cons (#1 thm_name));
+      fun on_use _ u = Synchronized.change used (cons (use_name u));
       val params = {every_use = true, on_use = on_use, on_loop = K (K ())};
       val _ =
         (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) state;
@@ -216,7 +220,7 @@ fun loop_rules state src =
     val proof_state = Toplevel.proof_of state;
     val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
     val loops = Synchronized.var "loops" [];
-    fun on_loop _ rules = Synchronized.change loops (cons (map (#1 o #1) rules));
+    fun on_loop _ rules = Synchronized.change loops (cons (map use_name rules));
     val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
   in
     (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) proof_state; NONE)
@@ -244,7 +248,7 @@ lemma "k 0 = 1"
   oops
 
 lemma "f x = g x \<Longrightarrow> g x = f x \<Longrightarrow> f x = 0"
-  ML_val \<open>expect_loop @{Isar.state} "(simp (no_asm_simp))" ["??.unknown"]\<close>
+  ML_val \<open>expect_loop @{Isar.state} "(simp (no_asm_simp))" ["rule"]\<close>
   oops
 
 ML \<open>
@@ -253,7 +257,7 @@ fun expect_no_loop state src =
     val proof_state = Toplevel.proof_of state;
     val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
     val loops = Synchronized.var "loops" [];
-    fun on_loop _ rules = Synchronized.change loops (cons (map (#1 o #1) rules));
+    fun on_loop _ rules = Synchronized.change loops (cons (map use_name rules));
     val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
     val {succeeded, ...} = Apply_Inspect.inspect params text proof_state;
   in
@@ -281,7 +285,7 @@ fun expect_step_loop state src source names =
     val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
     val loops = Synchronized.var "loops" [];
     fun on_loop source' rules =
-      Synchronized.change loops (cons (source', map (#1 o #1) rules));
+      Synchronized.change loops (cons (source', map use_name rules));
     val params = {every_use = false, on_use = K (K ()), on_loop = on_loop};
     val terminated =
       (Timeout.apply (seconds 0.5) (Apply_Inspect.inspect params text) proof_state; true)
@@ -324,6 +328,38 @@ lemma "sum_list [1..<30] = (435::nat)"
 lemma "rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev (rev
     (rev (rev (rev (rev (rev (rev xs))))))))))))))))))))))) = xs"
   ML_val \<open>expect_no_loop @{Isar.state} "simp"\<close>
+  oops
+
+
+text \<open>Assumptions of the proof context are reported as such.\<close>
+
+lemma
+  assumes a: "P x" and b: "x = y"
+  shows "x \<noteq> 0 \<and> x = y \<and> x = z"
+  ML_val \<open>
+    let
+      val prefix = "rule conjI, rule P_nonzero, rule a, rule conjI, ";
+      (*assumptions are hypotheses, which form a set: reported once per branch*)
+      val same_branch = "(" ^ prefix ^ "rule b, rule b, fail)";
+      val two_branches = "(" ^ prefix ^ "((rule b, fail) | (rule b, fail)))";
+      fun counts src =
+        (count_uses false @{Isar.state} src "assumption local.b",
+          count_uses true @{Isar.state} src "assumption local.b");
+      val (_, uses) = inspect_test @{Isar.state} same_branch;
+    in
+      (case (counts same_branch, counts two_branches) of
+        ((1, 1), (1, 2)) =>
+          if member (op =) uses "assumption local.a" then ()
+          else error ("Missing assumption a: " ^ commas uses)
+      | ((a, b), (c, d)) => error ("Bad counts: " ^ commas (map string_of_int [a, b, c, d])))
+    end\<close>
+  oops
+
+lemma
+  assumes step: "\<And>n. Q (Suc n) \<Longrightarrow> Q n"
+  shows "Q 0"
+  ML_val \<open>expect_step_loop @{Isar.state} "(fast intro: step)" "classical"
+    ["assumption local.step"]\<close>
   oops
 
 
@@ -383,6 +419,17 @@ lemma "(\<forall>x. x \<in> A \<longrightarrow> x \<in> B) \<Longrightarrow> A \
 
 lemma "length (xs @ ys) = length xs + length ys \<and> xs = ys"
   ML_val \<open>expect_same_outcome @{Isar.state} outcome_methods\<close>
+  oops
+
+lemma
+  assumes "P x" and "x = y"
+  shows "y \<noteq> 0 \<and> P y"
+  ML_val \<open>expect_same_outcome @{Isar.state}
+    (outcome_methods @
+      ["(simp add: assms)", "(auto intro: assms P_nonzero)", "(insert assms, auto)",
+       "(insert assms, fastforce dest: P_nonzero)", "(insert assms, blast dest: P_nonzero)",
+       "(use assms in \<open>force dest: P_nonzero\<close>)", "(metis assms P_nonzero)",
+       "(rule conjI, insert assms, simp_all, fail)"])\<close>
   oops
 
 lemma "\<exists>f. \<forall>x::nat. f x = Suc x"
