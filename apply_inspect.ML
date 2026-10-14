@@ -26,7 +26,8 @@ sig
    {every_use: bool,
     on_use: string -> use -> unit,
     on_loop: string -> use list -> unit}
-  val inspect: params -> Method.text -> Proof.state -> {succeeded: bool, uses: use list}
+  val inspect: params -> Method.text -> Proof.state ->
+    {succeeded: bool, error: string option, uses: use list}
   val pretty_uses: Proof.context -> use list -> Pretty.T
   val use_filter: Proof.state -> (bool * string Find_Theorems.criterion) list -> use -> bool
   val apply_inspect: (bool * string Find_Theorems.criterion) list option -> Method.text_range ->
@@ -136,13 +137,18 @@ fun assumption_names ctxt =
 
 (* fresh goal state without dependencies *)
 
-val (_, fresh_state) =
-  Context.>>> (Context.map_theory_result (Thm.add_oracle (\<^binding>\<open>apply_inspect\<close>, I)));
+(*The oracle is declared for each run, in the private theory of the run, so that it also works
+  for goals from theories that do not import this one. Theorems produced by an oracle are
+  certified only by the identity of the oracle's theory, without its content, so they are
+  transferred to the private theory explicitly.*)
+fun add_oracle thy =
+  let val ((_, oracle), thy') = Thm.add_oracle (\<^binding>\<open>apply_inspect\<close>, I) thy
+  in (Thm.transfer thy' o oracle, thy') end;
 
 (*copy of the goal state without dependencies, with the same hypotheses, unless the copy would
   differ in flex-flex constraints or sort hypotheses (which would affect the behaviour of
   tactics)*)
-fun refresh_state st =
+fun refresh_state fresh_state st =
   let
     fun copy () =
       let val hyps = Thm.chyps_of st in
@@ -420,12 +426,12 @@ fun collected_uses ctxt collector hyps_collector =
 
 val hook_name = "apply_inspect";
 
-fun instrument_context ({observe, step, ...}: events) ctxt =
+fun instrument_context fresh_state ({observe, step, ...}: events) ctxt =
   let
     fun wrapper _ tac i st =
       let
         val _ = observe "classical" st;
-        val st0 = refresh_state st;
+        val st0 = refresh_state fresh_state st;
         val size =
           (case try (Thm.cprem_of st) i of
             SOME ct => size_of_term (Thm.term_of ct)
@@ -456,12 +462,12 @@ fun simp_trace_ops ({rewrite, ...}: events) : Raw_Simplifier.trace_ops =
     in res end,
   trace_simproc = K (fn ctxt => fn cont => cont ctxt)};
 
-fun instrument_text ({observe, step, ...}: events) =
+fun instrument_text fresh_state ({observe, step, ...}: events) =
   let
     fun wrap_method source (m: Method.method) : Method.method = fn facts => fn (ctxt, st) =>
       let
         val _ = observe source st;
-        val st0 = refresh_state st;
+        val st0 = refresh_state fresh_state st;
       in
         m facts (ctxt, st0) |> Seq.map (fn result =>
           ((case result of
@@ -496,21 +502,28 @@ fun run params text state =
     val events = make_events ctxt collector hyps_collector params;
 
     (*the results of the run are discarded, so its contexts may live in a private theory*)
-    val thy' = Raw_Simplifier.set_trace_ops (simp_trace_ops events) (Proof_Context.theory_of ctxt);
-    val instrument = Proof_Context.transfer thy' #> instrument_context events;
+    val (fresh_state, thy') =
+      Proof_Context.theory_of ctxt
+      |> Raw_Simplifier.set_trace_ops (simp_trace_ops events)
+      |> add_oracle;
+    val instrument = Proof_Context.transfer thy' #> instrument_context fresh_state events;
 
     val result =
       Exn.result (fn () =>
         (instrument goal_ctxt, fresh_state (Thm.cprop_of goal))
-        |> Method.evaluate (instrument_text events text) (instrument ctxt) using
+        |> Method.evaluate (instrument_text fresh_state events text) (instrument ctxt) using
         |> Seq.filter_results
         |> Seq.pull
         |> is_some) ();
   in (result, collected_uses ctxt collector hyps_collector) end;
 
+(*error: exception raised by the method or by the instrumentation, as opposed to plain failure*)
 fun inspect params text state =
-  let val (result, uses) = run params text state
-  in {succeeded = (case result of Exn.Res b => b | Exn.Exn _ => false), uses = uses} end;
+  let val (result, uses) = run params text state in
+    (case result of
+      Exn.Res b => {succeeded = b, error = NONE, uses = uses}
+    | Exn.Exn exn => {succeeded = false, error = SOME (Runtime.exn_message exn), uses = uses})
+  end;
 
 fun pretty_uses ctxt uses =
   let

@@ -1,5 +1,5 @@
 theory Apply_Inspect_Test
-  imports Apply_Inspect
+  imports Apply_Inspect Apply_Inspect_Unrelated
 begin
 
 ML \<open>
@@ -15,7 +15,7 @@ fun inspect_test state src =
     val ctxt = Proof.context_of proof_state;
     val (text, _) = Method.read_closure_input ctxt (Input.string src);
     val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
-    val {succeeded, uses} = Apply_Inspect.inspect params text proof_state;
+    val {succeeded, uses, ...} = Apply_Inspect.inspect params text proof_state;
     val _ = Pretty.writeln (Apply_Inspect.pretty_uses ctxt uses);
   in (succeeded, map use_name uses) end;
 
@@ -515,6 +515,46 @@ lemma
 lemma "\<exists>f. \<forall>x::nat. f x = Suc x"
   ML_val \<open>expect_same_outcome @{Isar.state} outcome_methods\<close>
   oops
+
+
+text \<open>Goals from theories that do not import Apply_Inspect.\<close>
+
+ML \<open>
+fun unrelated_state goal =
+  let
+    val ctxt = Proof_Context.init_global \<^theory>\<open>Apply_Inspect_Unrelated\<close>;
+  in Proof.theorem NONE (K I) [[(Syntax.read_prop ctxt goal, [])]] ctxt end;
+
+fun check_unrelated goal src expected =
+  let
+    val state = unrelated_state goal;
+    val (text, _) = Method.read_closure_input (Proof.context_of state) (Input.string src);
+    val plain =
+      the_default false (try (fn () =>
+        Proof.apply (text, Position.no_range) state |> Seq.filter_results |> Seq.pull |> is_some) ());
+    val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+    val result = Apply_Inspect.inspect params text state;
+    val uses = map use_name (#uses result);
+  in
+    if is_some (#error result) then error ("Error for " ^ src ^ ": " ^ the (#error result))
+    else if #succeeded result <> plain then
+      error ("Different outcome for " ^ src ^ ": " ^ Bool.toString plain ^ " vs. " ^
+        Bool.toString (#succeeded result))
+    else if exists (fn name => not (member (op =) uses name)) expected then
+      error ("Missing uses for " ^ src ^ ": " ^ commas uses)
+    else ()
+  end;
+\<close>
+
+ML_val \<open>
+  check_unrelated "rev (rev xs) = xs \<and> (xs::nat list) = ys" "(rule conjI, auto)" ["HOL.conjI"];
+  check_unrelated "rev (rev xs) = xs \<and> (xs::nat list) = ys" "(rule conjI, auto, fail)"
+    ["HOL.conjI", "List.rev_rev_ident"];
+  check_unrelated "rev (rev xs) = xs \<and> (xs::nat list) = ys" "(rule conjI, force)" ["HOL.conjI"];
+  check_unrelated "\<exists>x::nat. x = Suc 0" "(rule exI, rule refl)" ["HOL.exI"];
+  check_unrelated "length (xs @ ys) = length xs + length ys \<and> xs = ys" "fastforce"
+    ["List.length_append"]
+\<close>
 
 
 text \<open>Dependencies of the goal state itself are not reported.\<close>
