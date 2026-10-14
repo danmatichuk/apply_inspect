@@ -161,6 +161,11 @@ fun refresh_state fresh_state st =
     | NONE => st)
   end;
 
+(*Reading a method runs it once on a dummy goal state (Method.method_closure), which is not
+  part of the run.*)
+val closure_state = Thm.prop_of (Goal.protect 0 Drule.dummy_thm);
+fun is_closure_state st = Thm.prop_of st aconv closure_state;
+
 
 (* loop detection *)
 
@@ -429,17 +434,20 @@ val hook_name = "apply_inspect";
 fun instrument_context fresh_state ({observe, step, ...}: events) ctxt =
   let
     fun wrapper _ tac i st =
-      let
-        val _ = observe "classical" st;
-        val st0 = refresh_state fresh_state st;
-        val size =
-          (case try (Thm.cprem_of st) i of
-            SOME ct => size_of_term (Thm.term_of ct)
-          | NONE => 0);
-        fun step_output st' =
-          step "classical" {input = st, start = st0, output = st', size = size};
-      in Seq.map (tap step_output) (tac i st0) end;
-    fun observe_tac (_: Proof.context) (_: int) st = (observe "simp" st; Seq.empty);
+      if is_closure_state st then tac i st
+      else
+        let
+          val _ = observe "classical" st;
+          val st0 = refresh_state fresh_state st;
+          val size =
+            (case try (Thm.cprem_of st) i of
+              SOME ct => size_of_term (Thm.term_of ct)
+            | NONE => 0);
+          fun step_output st' =
+            step "classical" {input = st, start = st0, output = st', size = size};
+        in Seq.map (tap step_output) (tac i st0) end;
+    fun observe_tac (_: Proof.context) (_: int) st =
+      (if is_closure_state st then () else observe "simp" st; Seq.empty);
     val solver = Simplifier.mk_solver hook_name observe_tac;
   in
     ctxt
@@ -465,18 +473,20 @@ fun simp_trace_ops ({rewrite, ...}: events) : Raw_Simplifier.trace_ops =
 fun instrument_text fresh_state ({observe, step, ...}: events) =
   let
     fun wrap_method source (m: Method.method) : Method.method = fn facts => fn (ctxt, st) =>
-      let
-        val _ = observe source st;
-        val st0 = refresh_state fresh_state st;
-      in
-        m facts (ctxt, st0) |> Seq.map (fn result =>
-          ((case result of
-              Seq.Result (_, st') =>
-                step source
-                  {input = st, start = st0, output = st', size = size_of_term (Thm.prop_of st)}
-            | Seq.Error _ => ());
-            result))
-      end;
+      if is_closure_state st then m facts (ctxt, st)
+      else
+        let
+          val _ = observe source st;
+          val st0 = refresh_state fresh_state st;
+        in
+          m facts (ctxt, st0) |> Seq.map (fn result =>
+            ((case result of
+                Seq.Result (_, st') =>
+                  step source
+                    {input = st, start = st0, output = st', size = size_of_term (Thm.prop_of st)}
+              | Seq.Error _ => ());
+              result))
+        end;
     fun method_name ctxt src =
       Name_Space.extern_shortest ctxt (Method.method_space (Context.Proof ctxt))
         (#1 (Token.name_of_src src));

@@ -567,4 +567,46 @@ lemma "xs = ys \<and> rev (rev xs) = xs"
     end\<close>
   oops
 
+text \<open>
+  Method text that is read without closure is closed during the run: exceptions raised while
+  reading the method are reported as errors, and the dummy goal state of the closure is not
+  inspected.
+\<close>
+
+ML \<open>
+fun read_text ctxt src =
+  Parse.read_embedded ctxt (Keyword.no_major_keywords (Thy_Header.get_keywords' ctxt))
+    (Scan.many Token.not_eof) (Input.string src)
+  |> Method.read ctxt;
+
+fun inspect_unclosed state src =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val text = read_text (Proof.context_of proof_state) src;
+    val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+  in Apply_Inspect.inspect params text proof_state end;
+\<close>
+
+lemma "xs = ys"
+  ML_val \<open>
+    (case inspect_unclosed @{Isar.state} "(tactic \<open>fn _ => error \"boom\"\<close>)" of
+      {succeeded = false, error = SOME msg, ...} =>
+        if String.isSubstring "boom" msg then () else error ("Bad error: " ^ msg)
+    | _ => error "No error reported")\<close>
+  oops
+
+lemma "rev (rev xs) = xs \<and> (xs::nat list) = ys"
+  ML_val \<open>
+    let
+      val {succeeded, error = err, uses} =
+        inspect_unclosed @{Isar.state} "(rule conjI, auto, fail)";
+    in
+      if succeeded orelse is_some err then error "Bad result"
+      else
+        (case filter_out (member (op =) (map use_name uses)) ["HOL.conjI", "List.rev_rev_ident"] of
+          [] => ()
+        | missing => error ("Missing: " ^ commas missing))
+    end\<close>
+  oops
+
 end
