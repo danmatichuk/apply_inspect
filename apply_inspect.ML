@@ -169,20 +169,25 @@ fun prefer_single (thm_name: Thm_Name.T) (thm_name': Thm_Name.T) =
 
 (*f x in a thread of its own, which is not a worker of the future scheduler: it only waits for
   forked proofs and never runs them itself, so that interrupting it after the timeout does not
-  interrupt (and cancel) them*)
+  interrupt (and cancel) them. The caller waits with a time limit instead of Timeout.apply, which
+  would interrupt the caller itself and could thus garble a timeout of an enclosing
+  Timeout.apply (two interrupts at once).*)
 fun join_limited timeout f x =
   let
-    val result = Single_Assignment.var "apply_inspect_join";
+    val result = Synchronized.var "apply_inspect_join" NONE;
     val thread =
       Isabelle_Thread.fork
         (Isabelle_Thread.params "apply_inspect_join" |> Isabelle_Thread.interrupts)
-        (fn () => Single_Assignment.assign result (Exn.capture0 f x));
+        (fn () => Synchronized.change result (K (SOME (Exn.capture0 f x))));
     fun stop () = Isabelle_Thread.interrupt_thread thread;
+    val limit = if Timeout.ignored timeout then NONE else SOME (Timeout.end_time timeout);
+    fun await () =
+      Synchronized.timed_access result (K limit) (fn NONE => NONE | some => SOME (some, some));
   in
-    (case Exn.capture0 (Timeout.apply timeout Single_Assignment.await) result of
-      Exn.Res (Exn.Res y) => SOME y
-    | Exn.Res (Exn.Exn _) => NONE
-    | Exn.Exn (Timeout.TIMEOUT _) => (stop (); NONE)
+    (case Exn.capture_body await of
+      Exn.Res (SOME (SOME (Exn.Res y))) => SOME y
+    | Exn.Res (SOME _) => NONE
+    | Exn.Res NONE => (stop (); NONE)
     | Exn.Exn exn => (stop (); Exn.reraise exn))
   end;
 
