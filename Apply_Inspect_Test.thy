@@ -138,6 +138,150 @@ lemma "h y = 0"
   oops
 
 
+text \<open>
+  After a timeout, the method is paused at the goal state that it has reached, which is kept as a
+  refinement of the goal by oracle, including the subgoals hidden by goal restriction. Each
+  further goal state continues the method for a step.
+\<close>
+
+ML \<open>
+(*subgoals of the first n goal states that the method reaches after the timeout (fewer if it
+  finishes)*)
+fun stepped_subgoals n state src =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
+    val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+    val limits = {timeout = seconds 0.2, step_time = seconds 0.1};
+  in
+    (case Apply_Inspect.inspect_limited params limits text proof_state of
+      {error = SOME msg, partial, ...} =>
+        (case Seq.list_of (Seq.take n partial) of
+          [] => error ("No goal states: " ^ msg)
+        | states => map (Thm.prems_of o #goal o Proof.simple_goal o #2) states)
+    | _ => error "Method terminated")
+  end;
+
+val first_subgoals = hd oo stepped_subgoals 1;
+
+fun suc_depth \<^Const_>\<open>Suc for t\<close> = suc_depth t + 1
+  | suc_depth _ = 0;
+
+(*n for a goal state with the single subgoal Q (Suc^n 0)*)
+fun q_depth [\<^Const_>\<open>Trueprop for \<open>\<^Const_>\<open>Q for t\<close>\<close>\<close>] = suc_depth t
+  | q_depth _ = error "Bad goal state";
+
+fun sleep_method t =
+  "(tactic \<open>fn st => (if Thm.nprems_of st > 0 then OS.Process.sleep (seconds " ^ t ^
+    ") else (); all_tac st)\<close>)";
+\<close>
+
+text \<open>A looping simplifier is paused before it returns.\<close>
+
+lemma "f 0 = 1 \<and> Q 0"
+  ML_val \<open>
+    if stepped_subgoals 3 @{Isar.state} "(rule conjI, simp add: f_g g_f)" =
+      replicate 3 [\<^prop>\<open>f 0 = 1\<close>, \<^prop>\<open>Q 0\<close>]
+    then () else error "Bad goal states"\<close>
+  oops
+
+lemma "Q 0 \<and> True"
+  ML_val \<open>
+    (case first_subgoals @{Isar.state} "(rule conjI, fast intro: Q_step)" of
+      [\<^Const_>\<open>Trueprop for \<open>\<^Const_>\<open>Q for _\<close>\<close>\<close>, \<^prop>\<open>True\<close>] => ()
+    | _ => error "Bad goal state")\<close>
+  oops
+
+text \<open>Each step continues the method.\<close>
+
+lemma "Q 0"
+  ML_val \<open>
+    let val depths = map q_depth (stepped_subgoals 4 @{Isar.state} "(fast intro: Q_step)") in
+      if length depths = 4 andalso sort int_ord depths = depths
+        andalso not (has_duplicates (op =) depths)
+      then ()
+      else error ("Bad goal states: " ^ commas (map string_of_int depths))
+    end\<close>
+  oops
+
+text \<open>Without progress, the goal is unchanged.\<close>
+
+lemma "f 0 = 1"
+  ML_val \<open>
+    if first_subgoals @{Isar.state} (sleep_method "2.0") = [\<^prop>\<open>f 0 = 1\<close>] then ()
+    else error "Bad goal state"\<close>
+  oops
+
+text \<open>The method may finish while it is continued: its result is the last goal state.\<close>
+
+lemma "True \<and> True"
+  ML_val \<open>
+    let
+      val states =
+        stepped_subgoals 100 @{Isar.state} ("(rule conjI, " ^ sleep_method "0.5" ^ ", simp_all)");
+    in
+      if length states >= 2 andalso null (List.last states) then ()
+      else error ("Bad goal states: " ^ string_of_int (length states))
+    end\<close>
+  oops
+
+text \<open>
+  A paused method is interrupted once its goal states are no longer referenced, e.g. after the
+  command has been removed from the document.
+\<close>
+
+lemma "Q 0"
+  ML_val \<open>
+    let
+      val proof_state = Toplevel.proof_of @{Isar.state};
+      val (text, _) =
+        Method.read_closure_input (Proof.context_of proof_state) (Input.string "(fast intro: Q_step)");
+      (*a weak reference to a value that only the method refers to*)
+      fun start () =
+        let
+          val marker = Unsynchronized.ref ();
+          val params = {every_use = false, on_use = fn _ => fn _ => Weak.touch marker,
+            on_loop = K (K ())};
+          val limits = {timeout = seconds 0.2, step_time = seconds 0.1};
+          val {partial, ...} = Apply_Inspect.inspect_limited params limits text proof_state;
+          val _ = Seq.pull partial;
+        in Weak.weak (SOME marker) end;
+      val marker_ref = start ();
+      fun stopped 0 = false
+        | stopped n =
+            (ML_Heap.full_gc (); is_none (! marker_ref)) orelse
+              (OS.Process.sleep (seconds 0.5); stopped (n - 1));
+    in if stopped 20 then () else error "Method not stopped" end\<close>
+  oops
+
+text \<open>
+  The command continues with the goal state at the timeout; \<^theory_text>\<open>back\<close> continues the
+  method.
+\<close>
+
+ML \<open>val first_depth = Unsynchronized.ref 0\<close>
+
+lemma "Q 0"
+  using [[apply_inspect_timeout = 300]]
+  apply_inspect (fast intro: Q_step)
+  ML_val \<open>first_depth := q_depth (Thm.prems_of (#goal (Proof.simple_goal
+    (Toplevel.proof_of @{Isar.state}))))\<close>
+  back
+  ML_val \<open>
+    if q_depth (Thm.prems_of (#goal (Proof.simple_goal (Toplevel.proof_of @{Isar.state}))))
+      > ! first_depth then ()
+    else error "back did not step forwards"\<close>
+  oops
+
+lemma "f 0 = 1 \<and> Q 0"
+  using [[apply_inspect_timeout = 300, apply_inspect_step_time = 50]]
+  apply_inspect (rule conjI, simp add: f_g g_f)
+  ML_val \<open>
+    if Thm.nprems_of (#goal (Proof.simple_goal (Toplevel.proof_of @{Isar.state}))) = 2 then ()
+    else error "Bad goal state"\<close>
+  oops
+
+
 text \<open>Local contexts and nested goals.\<close>
 
 context

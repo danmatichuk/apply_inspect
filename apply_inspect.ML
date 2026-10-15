@@ -3,20 +3,30 @@
 Diagnostic variant of "apply": if the proof method fails, report the
 theorems that were used during the failed attempt.
 
-The method is first run on a copy of the goal state that is produced by an
-oracle (so that it has no theorem dependencies of its own), in a context
-where the classical reasoner and the simplifier record every intermediate
-goal state they see, and the simplifier records every rewrite rule it
-tries. Before each method or classical step, the goal state is copied again
-in the same way, so that the result of the step depends on exactly the
-theorems that the step used. The results of that run are always discarded:
-if the method succeeds, it is run again without instrumentation.
+The method is first run on a copy of the goal state that is produced by the
+oracle of skipped proofs (so that it has no theorem dependencies of its
+own), in a context where the classical reasoner and the simplifier record
+every intermediate goal state they see, and the simplifier records every
+rewrite rule it tries. Before each method or classical step, the goal state
+is copied again in the same way, so that the result of the step depends on
+exactly the theorems that the step used. The results of that run are
+discarded: if the method succeeds, it is run again without instrumentation.
+
+If the method exceeds the time limit apply_inspect_timeout (in ms), it is paused
+and the command continues with the goal state that the method has reached,
+as a skipped proof. The method runs in a thread of its own, which pauses at
+the next point where the instrumentation is called (method or classical
+step, rewrite rule or simproc). Each "back" continues it for
+apply_inspect_step_time and yields the goal state that it has reached then,
+so that "back" steps through the run of the method.
 *)
 
 signature APPLY_INSPECT =
 sig
   val every_use: bool Config.T
-  val join_timeout: real Config.T
+  val join_timeout: int Config.T
+  val timeout: int Config.T
+  val step_time: int Config.T
   datatype use =
     Theorem of Thm_Name.P |
     Fact of Thm_Name.T |
@@ -31,6 +41,10 @@ sig
     on_loop: string -> use list -> unit}
   val inspect: params -> Method.text -> Proof.state ->
     {succeeded: bool, error: string option, uses: use list}
+  val inspect_limited: params -> {timeout: Time.time, step_time: Time.time} ->
+    Method.text -> Proof.state ->
+    {succeeded: bool, error: string option, uses: use list,
+      partial: (Time.time * Proof.state) Seq.seq}
   val pretty_uses: Proof.context -> use list -> Pretty.T
   val use_filter: Proof.state -> (bool * string Find_Theorems.criterion) list -> use -> bool
   val apply_inspect: (bool * string Find_Theorems.criterion) list option -> Method.text_range ->
@@ -44,10 +58,20 @@ struct
 val every_use =
   Attrib.setup_config_bool \<^binding>\<open>apply_inspect_every_use\<close> (K false);
 
-(*time limit (in seconds, 0 for none) for waiting on proofs of other theorems, which may still
-  be running in a forked task, or never finish: their dependencies are left out*)
+(*time limit (in milliseconds, 0 for none) for waiting on proofs of other theorems, which may
+  still be running in a forked task, or never finish: their dependencies are left out*)
 val join_timeout =
-  Attrib.setup_config_real \<^binding>\<open>apply_inspect_join_timeout\<close> (K 0.1);
+  Attrib.setup_config_int \<^binding>\<open>apply_inspect_join_timeout\<close> (K 100);
+
+(*time limit (in milliseconds, 0 for none) for the method: if it is exceeded, the method is
+  paused and the command continues with the goal state that it has reached, as a refinement of
+  the goal by the oracle of skipped proofs*)
+val timeout =
+  Attrib.setup_config_int \<^binding>\<open>apply_inspect_timeout\<close> (K 0);
+
+(*time (in milliseconds) for which each "back" after the timeout continues the method*)
+val step_time =
+  Attrib.setup_config_int \<^binding>\<open>apply_inspect_step_time\<close> (K 100);
 
 
 (* uses *)
@@ -164,7 +188,7 @@ fun join_limited timeout f x =
 
 (*dependencies of a theorem, unless they wait for unfinished proofs of other theorems*)
 fun thm_deps_limited ctxt =
-  join_limited (seconds (Config.get ctxt join_timeout)) Thm.thm_deps;
+  join_limited (Time.fromMilliseconds (Config.get ctxt join_timeout)) Thm.thm_deps;
 
 (*dependencies of a node whose proof is finished, without waiting for it*)
 fun finished_node_thms node =
@@ -263,13 +287,9 @@ fun assumption_names ctxt =
 
 (* fresh goal state without dependencies *)
 
-(*The oracle is declared for each run, in the private theory of the run, so that it also works
-  for goals from theories that do not import this one. Theorems produced by an oracle are
-  certified only by the identity of the oracle's theory, without its content, so they are
-  transferred to the private theory explicitly.*)
-fun add_oracle thy =
-  let val ((_, oracle), thy') = Thm.add_oracle (\<^binding>\<open>apply_inspect\<close>, I) thy
-  in (Thm.transfer thy' o oracle, thy') end;
+(*goal states are produced by the oracle of skipped proofs, which every theory has, and
+  transferred to the private theory of the run*)
+fun fresh_state_of thy = Thm.transfer thy o Skip_Proof.make_thm_cterm;
 
 (*copy of the goal state without dependencies, with the same hypotheses, unless the copy would
   differ in flex-flex constraints or sort hypotheses (which would affect the behaviour of
@@ -291,6 +311,23 @@ fun refresh_state fresh_state st =
   part of the run.*)
 val closure_state = Thm.prop_of (Goal.protect 0 Drule.dummy_thm);
 fun is_closure_state st = Thm.prop_of st aconv closure_state;
+
+(*proposition of an intermediate goal state as a refinement of the goal, with the subgoals that
+  goal restriction hides (Goal.restrict, e.g. in SELECT_GOAL) in a different order; NONE for
+  goal states of other goals, e.g. of conditions of rewrite rules or of focused subgoals*)
+fun goal_refinement goal st =
+  let
+    val concl = Thm.concl_of goal;
+    fun unfold prems t =
+      if t aconv concl then SOME (Logic.list_implies (prems, t))
+      else
+        (case try Logic.unprotect t of
+          SOME u => unfold (prems @ Logic.strip_imp_prems u) (Logic.strip_imp_concl u)
+        | NONE => NONE);
+  in
+    if subset (op aconv) (Thm.hyps_of st, Thm.hyps_of goal)
+    then unfold (Thm.prems_of st) (Thm.concl_of st) else NONE
+  end;
 
 
 (* loop detection *)
@@ -558,12 +595,15 @@ fun collected_uses ctxt collector hyps_collector =
 
 val hook_name = "apply_inspect";
 
-fun instrument_context fresh_state ({observe, step, ...}: events) ctxt =
+(*checkpoint: called where the method may be paused*)
+
+fun instrument_context fresh_state checkpoint ({observe, step, ...}: events) ctxt =
   let
     fun wrapper _ tac i st =
       if is_closure_state st then tac i st
       else
         let
+          val _ = checkpoint ();
           val _ = observe "classical" st;
           val st0 = refresh_state fresh_state st;
           val size =
@@ -585,24 +625,26 @@ fun instrument_context fresh_state ({observe, step, ...}: events) ctxt =
     |> Simplifier.add_safe_solver solver
   end;
 
-fun simp_trace_ops ({rewrite, ...}: events) : Raw_Simplifier.trace_ops =
+fun simp_trace_ops checkpoint ({rewrite, ...}: events) : Raw_Simplifier.trace_ops =
  {trace_invoke = K I,
   trace_rrule = fn {thm, rrule = {thm = rule, name, ...}, cterm, ...} => fn ctxt => fn cont =>
     let
+      val _ = checkpoint ();
       val res = cont ctxt;
       val result = Option.map (Thm.term_of o Thm.rhs_of o #1) res;
       val _ =
         rewrite {instance = thm, rule = rule, name = name, redex = Thm.term_of cterm,
           result = result};
     in res end,
-  trace_simproc = K (fn ctxt => fn cont => cont ctxt)};
+  trace_simproc = K (fn ctxt => fn cont => (checkpoint (); cont ctxt))};
 
-fun instrument_text fresh_state ({observe, step, ...}: events) =
+fun instrument_text fresh_state checkpoint ({observe, step, ...}: events) =
   let
     fun wrap_method source (m: Method.method) : Method.method = fn facts => fn (ctxt, st) =>
       if is_closure_state st then m facts (ctxt, st)
       else
         let
+          val _ = checkpoint ();
           val _ = observe source st;
           val st0 = refresh_state fresh_state st;
         in
@@ -628,41 +670,193 @@ fun instrument_text fresh_state ({observe, step, ...}: events) =
 
 (* inspect *)
 
-fun run params text state =
+(*The method runs in a thread of its own if it has a time limit: once its time is up, it pauses
+  at the next checkpoint until it is continued. The goal states that it reaches later hold a
+  token, which the paused method refers to only weakly: when they are gone (e.g. because the
+  command has been removed from the document), the method is interrupted.*)
+datatype control = Run of Time.time | Pause | Done of bool Exn.result;
+
+(*how often a paused method checks whether its goal states are still referenced*)
+val pause_check = seconds 1.0;
+
+(*goal state reached by a run of the method after the time limit: running time, refinement of
+  the goal (if any), and the outcome, if the method has finished*)
+type progress = {time: Time.time, refinement: term option, finished: bool Exn.result option};
+
+(*result: outcome of the method (TIMEOUT if it exceeds the time limit), theorems used, and the
+  goal states that it reaches: at the time limit, and after each further step, until it has
+  finished*)
+fun run params {timeout, step_time} text state =
   let
     val _ = Proof.assert_backward state;
     val ctxt = Proof.context_of state;
     val {context = goal_ctxt, facts = using, goal} = Proof.raw_goal state;
+    val limited = not (Timeout.ignored timeout);
+
+    (*messages of the instrumentation go to the command that has continued the method last*)
+    val output_pos = Synchronized.var "apply_inspect_output" (Position.thread_data ());
+    fun output f x = Position.setmp_thread_data (Synchronized.value output_pos) f x;
+    val params' =
+     {every_use = #every_use params,
+      on_use = fn source => output (#on_use params source),
+      on_loop = fn source => output (#on_loop params source)};
 
     val collector = Synchronized.var "apply_inspect" Inttab.empty;
     val hyps_collector = Synchronized.var "apply_inspect_hyps" Termtab.empty;
-    val events = make_events ctxt collector hyps_collector params;
+
+    (*the goal state that the method last reached*)
+    val last = Synchronized.var "apply_inspect_last" NONE;
+    fun record st =
+      (case goal_refinement goal st of
+        SOME prop => Synchronized.change last (K (SOME prop))
+      | NONE => ());
+    fun refinement () =
+      Synchronized.value last |> Option.mapPartial (fn prop =>
+        if prop aconv Thm.prop_of goal then NONE else SOME prop);
+    val events =
+      let val {observe, step, rewrite} = make_events ctxt collector hyps_collector params' in
+        {observe = observe, rewrite = rewrite,
+          step = fn source => fn args as {output, ...} => (record output; step source args)}
+      end;
+
+    val start = Time.now ();
+    val control =
+      Synchronized.var "apply_inspect_control" (Run (start + Timeout.scale_time timeout));
+    val token = Unsynchronized.ref ();
+    val token_ref = Weak.weak (SOME token);
+    fun wait_continued () =
+      let val limit = Time.now () + pause_check in
+        (case Synchronized.timed_access control (K (SOME limit))
+            (fn Pause => NONE | c => SOME ((), c)) of
+          SOME () => ()
+        | NONE =>
+            if is_some (! token_ref) then wait_continued ()
+            else Isabelle_Thread.raise_interrupt ())
+      end;
+    fun checkpoint () =
+      if not limited then ()
+      else
+        (case Synchronized.value control of
+          Run deadline =>
+            if Time.now () < deadline then ()
+            else
+              (Synchronized.change control (fn c as Run deadline =>
+                  if Time.now () < deadline then c else Pause
+                | c => c);
+               wait_continued ())
+        | _ => ());
 
     (*the results of the run are discarded, so its contexts may live in a private theory*)
-    val (fresh_state, thy') =
+    val thy' =
       Proof_Context.theory_of ctxt
-      |> Raw_Simplifier.set_trace_ops (simp_trace_ops events)
-      |> add_oracle;
-    val instrument = Proof_Context.transfer thy' #> instrument_context fresh_state events;
+      |> Raw_Simplifier.set_trace_ops (simp_trace_ops checkpoint events);
+    val fresh_state = fresh_state_of thy';
+    val instrument =
+      Proof_Context.transfer thy' #> instrument_context fresh_state checkpoint events;
 
-    val result =
-      Exn.result (fn () =>
-        (instrument goal_ctxt, fresh_state (Thm.cprop_of goal))
-        |> Method.evaluate (instrument_text fresh_state events text) (instrument ctxt) using
-        |> Seq.filter_results
-        |> Seq.pull
-        |> is_some) ();
-  in (result, collected_uses ctxt collector hyps_collector) end;
+    fun evaluate () =
+      (instrument goal_ctxt, fresh_state (Thm.cprop_of goal))
+      |> Method.evaluate (instrument_text fresh_state checkpoint events text) (instrument ctxt)
+        using
+      |> Seq.filter_results
+      |> Seq.pull
+      |> Option.map (fn ((_, st), _) => record st)
+      |> is_some;
 
-(*error: exception raised by the method or by the instrumentation, as opposed to plain failure*)
-fun inspect params text state =
-  let val (result, uses) = run params text state in
-    (case result of
-      Exn.Res b => {succeeded = b, error = NONE, uses = uses}
-    | Exn.Exn exn => {succeeded = false, error = SOME (Runtime.exn_message exn), uses = uses})
+    fun uses () = collected_uses ctxt collector hyps_collector;
+  in
+    if not limited then {result = Exn.result evaluate (), uses = uses (), progress = Seq.empty}
+    else
+      let
+        val pos = Position.thread_data ();
+        val context = Context.get_generic_context ();
+        val worker =
+          Isabelle_Thread.fork (Isabelle_Thread.params "apply_inspect" |> Isabelle_Thread.interrupts)
+            (fn () =>
+              let
+                val result =
+                  Exn.capture0
+                    (Position.setmp_thread_data pos (Context.setmp_generic_context context evaluate))
+                    ();
+              in Synchronized.change control (K (Done result)) end);
+
+        (*wait until the method pauses or finishes, or until the given time, if it does not reach
+          a checkpoint (it then continues until it does)*)
+        fun await limit =
+          Synchronized.timed_access control (K (SOME limit))
+            (fn Run _ => NONE | c => SOME (c, c));
+
+        fun progress time c =
+          let
+            val finished = (case c of SOME (Done result) => SOME result | _ => NONE);
+            val rest =
+              if is_some finished then Seq.empty
+              else Seq.make (fn () => Seq.pull (continue time));
+          in Seq.cons {time = time, refinement = refinement (), finished = finished} rest end
+        and continue time =
+          let
+            val _ = Weak.touch token;
+            val _ = Synchronized.change output_pos (K (Position.thread_data ()));
+            val t0 = Time.now ();
+            val step = Timeout.scale_time step_time;
+            val _ = Synchronized.change control (fn c as Done _ => c | _ => Run (t0 + step));
+            val c = await (t0 + step + step);
+          in progress (time + (Time.now () - t0)) c end;
+
+        (*the command may be interrupted while it waits*)
+        val c =
+          (case Exn.capture_body (fn () => await (start + Timeout.scale_time (timeout + step_time))) of
+            Exn.Res c => c
+          | Exn.Exn exn => (Isabelle_Thread.interrupt_thread worker; Exn.reraise exn));
+        val time = Time.now () - start;
+      in
+        (case c of
+          SOME (Done result) => {result = result, uses = uses (), progress = Seq.empty}
+        | _ =>
+            {result = Exn.Exn (Timeout.TIMEOUT time), uses = uses (), progress = progress time c})
+      end
   end;
 
-fun pretty_uses ctxt uses =
+(*proof state with the goal refined to the given proposition by the oracle of skipped proofs, as
+  after "apply" (goal states of the run belong to its private theory)*)
+fun refine_by_oracle state prop =
+  state
+  |> Proof.refine_primitive (fn ctxt => fn _ => Skip_Proof.make_thm_cterm (Thm.cterm_of ctxt prop))
+  |> Proof.using_facts [];
+
+fun refined_state state NONE = state
+  | refined_state state (SOME prop) = refine_by_oracle state prop;
+
+(*error: exception raised by the method or by the instrumentation, as opposed to plain failure;
+  partial: if the method exceeds the time limit, the proof states with the goal states that it
+  reaches (the given state while there is none), with its running time: at the time limit, and
+  after each further step, until it has finished (the last one is its result if it succeeds)*)
+fun inspect_limited params limits text state =
+  let
+    val {result, uses, progress} = run params limits text state;
+    fun partial xq =
+      Seq.make (fn () =>
+        (case Seq.pull xq of
+          SOME ({time, refinement, finished = NONE}, xq') =>
+            SOME ((time, refined_state state refinement), partial xq')
+        | SOME ({time, refinement, finished = SOME (Exn.Res true)}, _) =>
+            SOME ((time, refined_state state refinement), Seq.empty)
+        | _ => NONE));
+  in
+    (case result of
+      Exn.Res b => {succeeded = b, error = NONE, uses = uses, partial = Seq.empty}
+    | Exn.Exn exn =>
+        {succeeded = false, error = SOME (Runtime.exn_message exn), uses = uses,
+          partial = partial progress})
+  end;
+
+fun inspect params text state =
+  let
+    val {succeeded, error, uses, ...} =
+      inspect_limited params {timeout = Time.zeroTime, step_time = Time.zeroTime} text state
+  in {succeeded = succeeded, error = error, uses = uses} end;
+
+fun pretty_use_list header ctxt uses =
   let
     val pretty = pretty_use ctxt;
     val items =
@@ -671,9 +865,10 @@ fun pretty_uses ctxt uses =
       |> sort_by #1
       |> map (fn (_, prt) => Pretty.item [prt]);
   in
-    Pretty.big_list
-      ("theorems used in failed method application: " ^ string_of_int (length items)) items
+    Pretty.big_list (header ^ ": " ^ string_of_int (length items)) items
   end;
+
+val pretty_uses = pretty_use_list "theorems used in failed method application";
 
 
 (* filter *)
@@ -698,8 +893,13 @@ fun use_filter state criteria =
 
 (* command *)
 
+(*the command is a diagnostic tool, not meant to stay in a proof*)
+fun report_bad () =
+  Output.report [Markup.markup (Markup.bad ()) "Diagnostic proof command"];
+
 fun apply_inspect criteria (text, range as (pos, _)) state =
   let
+    val _ = report_bad ();
     val ctxt = Proof.context_of state;
     val pretty = pretty_use ctxt;
     val printed =
@@ -726,10 +926,51 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
           (Pretty.big_list (what ^ " may be looping, repeatedly using:") items))
       end;
     val params = {every_use = Config.get ctxt every_use, on_use = on_use, on_loop = on_loop};
+    val limits =
+     {timeout = Time.fromMilliseconds (Config.get ctxt timeout),
+      step_time = Time.fromMilliseconds (Config.get ctxt step_time)};
+    fun ms t = string_of_int (Time.toMilliseconds t) ^ " ms";
+    val continue_msg = "\"back\" continues it for " ^ ms (#step_time limits);
+
+    (*the goal states that the method reaches, as alternative results for "back"; each one is
+      reported when it is reached*)
+    fun results first prev xq =
+      Seq.make (fn () =>
+        (case Seq.pull xq of
+          NONE => NONE
+        | SOME ({time, refinement, finished}, xq') =>
+            let
+              val after = " after " ^ ms time;
+              val goal_state =
+                (case refinement of
+                  NONE => "the unchanged goal"
+                | SOME prop =>
+                    "the goal state reached" ^
+                    (case prev of
+                      SOME prop' => if prop aconv prop' then " (unchanged)" else ""
+                    | NONE => "") ^ " (skipped proof)");
+              val state' = refined_state state refinement;
+            in
+              (case finished of
+                NONE =>
+                  (warning ((if first then "Timeout" ^ after ^ ": method paused at "
+                      else "Method paused" ^ after ^ " at ") ^ goal_state ^ "; " ^ continue_msg);
+                   SOME (Seq.Result state', results false refinement xq'))
+              | SOME (Exn.Res true) =>
+                  (warning ("Method finished" ^ after ^ " with " ^ goal_state);
+                   SOME (Seq.Result state', Seq.empty))
+              | SOME (Exn.Res false) => (warning ("Method failed" ^ after); NONE)
+              | SOME (Exn.Exn exn) =>
+                  (warning ("Method failed" ^ after ^ ": " ^ Runtime.exn_message exn); NONE))
+            end));
   in
-    (case run params text state of
-      (Exn.Res true, _) => Proof.apply (text, range) state
-    | (result, uses) =>
+    (case run params limits text state of
+      {result = Exn.Res true, ...} => Proof.apply (text, range) state
+    | {result = Exn.Exn (Timeout.TIMEOUT _), uses, progress} =>
+        (Pretty.writeln (pretty_use_list "theorems used before the timeout" ctxt
+          (filter printed uses));
+         results true NONE progress)
+    | {result, uses, ...} =>
         (Pretty.writeln (pretty_uses ctxt (filter printed uses));
          (case result of
            Exn.Exn exn => Exn.reraise exn
@@ -743,6 +984,7 @@ val _ =
   Outer_Syntax.command \<^command_keyword>\<open>apply_inspect\<close>
     "initial goal refinement step (unstructured), reporting theorems used if it fails"
     (criteria -- Method.parse >> (fn (crit, m) =>
-      (Method.report m; Toplevel.proofs (apply_inspect crit m))));
+      (Method.report m;
+        Toplevel.proofs (apply_inspect crit m) o Toplevel.skip_proof report_bad)));
 
 end;
