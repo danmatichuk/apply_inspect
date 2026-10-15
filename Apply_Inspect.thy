@@ -11,4 +11,8 @@ begin
 
 ML_file \<open>apply_inspect.ML\<close>
 
+declare eq_reflection [apply_inspect_hide] and TrueI [apply_inspect_hide]
+  and Eq_TrueI [apply_inspect_hide] and Eq_FalseI [apply_inspect_hide]
+  and simp_thms [apply_inspect_hide]
+
 end

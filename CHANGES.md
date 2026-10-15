@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `apply_inspect` no longer reports infrastructure: theorems of Pure, class axioms
+  (definition, introduction rule and axioms of a class as recorded by `Axclass`, and
+  theorems concluding a sort constraint, e.g. class relations and arities), locale axioms
+  (introduction rules and axioms as recorded by `Locale`, and the definitions of locale
+  predicates), and theorems declared with the new attribute `apply_inspect_hide`
+  (`eq_reflection`, `TrueI`, `Eq_TrueI`, `Eq_FalseI` and `simp_thms` are declared so). The
+  new option `apply_inspect_show_infrastructure` (default `false`) reports them again.
+  `Apply_Inspect.infrastructure` offers the test in ML; the uses returned by the ML
+  functions are not filtered.
+
+  ```isabelle
+  declare foo [apply_inspect_hide]       (* hide foo *)
+  declare foo [apply_inspect_hide del]   (* show it again *)
+  ```
+
 - `apply_inspect` is always marked as `bad` (like `sorry` or `back`), as a diagnostic command
   that is not meant to stay in a proof.
 

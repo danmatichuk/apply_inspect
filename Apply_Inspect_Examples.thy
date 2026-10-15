@@ -63,6 +63,27 @@ lemma "length (xs @ ys) = length xs + length ys \<and> xs = ys"
   oops
 
 text \<open>
+  Infrastructure is left out of the report: theorems of Pure, class axioms (including class
+  relations and arities, e.g. @{thm [source] arity_type_nat}), locale axioms, and theorems
+  declared with the attribute @{attribute apply_inspect_hide}, such as
+  @{thm [source] eq_reflection}. With @{attribute apply_inspect_show_infrastructure}, they are
+  reported as well.
+\<close>
+
+lemma "length (xs @ ys) = length xs + length ys \<and> xs = ys"
+  using [[apply_inspect_show_infrastructure]]
+  apply_inspect fastforce
+  oops
+
+declare length_append [apply_inspect_hide]
+
+lemma "length (xs @ ys) = length xs + length ys \<and> xs = ys"
+  apply_inspect fastforce
+  oops
+
+declare length_append [apply_inspect_hide del]
+
+text \<open>
   By default, each theorem is reported once. With @{attribute apply_inspect_every_use}, every use
   is reported as it happens, here both uses of @{thm conjI}.
 \<close>

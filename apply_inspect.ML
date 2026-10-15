@@ -27,6 +27,7 @@ sig
   val join_timeout: int Config.T
   val timeout: int Config.T
   val step_time: int Config.T
+  val show_infrastructure: bool Config.T
   datatype use =
     Theorem of Thm_Name.P |
     Fact of Thm_Name.T |
@@ -46,6 +47,7 @@ sig
     {succeeded: bool, error: string option, uses: use list,
       partial: {time: Time.time, state: Proof.state, uses: use list} Seq.seq}
   val pretty_uses: Proof.context -> use list -> Pretty.T
+  val infrastructure: Proof.context -> use -> bool
   val use_filter: Proof.state -> (bool * string Find_Theorems.criterion) list -> use -> bool
   val apply_inspect: (bool * string Find_Theorems.criterion) list option -> Method.text_range ->
     Proof.state -> Proof.state Seq.result Seq.seq
@@ -72,6 +74,11 @@ val timeout =
 (*time (in milliseconds) for which each "back" after the timeout continues the method*)
 val step_time =
   Attrib.setup_config_int \<^binding>\<open>apply_inspect_step_time\<close> (K 100);
+
+
+(*show theorems that are infrastructure (see infrastructure below)*)
+val show_infrastructure =
+  Attrib.setup_config_bool \<^binding>\<open>apply_inspect_show_infrastructure\<close> (K false);
 
 
 (* uses *)
@@ -885,6 +892,96 @@ val pretty_uses = pretty_use_list "theorems used in failed method application";
 
 (* filter *)
 
+(*theorems declared as infrastructure with the attribute apply_inspect_hide*)
+structure Hidden = Generic_Data
+(
+  type T = thm Item_Net.T;
+  val empty = Thm.item_net;
+  val merge = Item_Net.merge;
+);
+
+val _ =
+  Theory.setup
+    (Attrib.setup \<^binding>\<open>apply_inspect_hide\<close>
+      (Attrib.add_del
+        (Thm.declaration_attribute (Hidden.map o Item_Net.update o Thm.trim_context))
+        (Thm.declaration_attribute (Hidden.map o Item_Net.remove)))
+      "declaration of theorems that apply_inspect does not show by default");
+
+(*global theorems that are infrastructure rather than content, as recorded by the modules that
+  produce them:
+    theorems of theory Pure,
+    class axioms: definition, introduction rule and axioms of a class (Axclass), and theorems
+      that conclude a sort constraint (e.g. class relations and arities),
+    locale axioms: introduction rules and axioms of a locale (Locale), and the definitions of
+      locale predicates (Defs),
+    theorems declared with the attribute apply_inspect_hide*)
+fun infrastructure ctxt =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val space = Facts.space_of (Global_Theory.facts_of thy);
+    (*declared theorems by name (not every theorem with the same statement), unnamed ones by
+      statement*)
+    val hidden = map (Thm.transfer' ctxt) (Item_Net.content (Hidden.get (Context.Proof ctxt)));
+    fun is_hidden thm_name thm =
+      hidden |> exists (fn th =>
+        let val th_name = Thm.derivation_name th in
+          if Thm_Name.is_empty th_name then Thm.eq_thm_prop (th, thm) else th_name = thm_name
+        end);
+
+    fun from_pure name =
+      try (Name_Space.theory_name {long = true} space) name = SOME Context.PureN;
+
+    (*theorems known by their derivation names*)
+    val module_thm_names =
+      Lazy.lazy (fn () =>
+        let
+          val class_thms =
+            Graph.keys (Sorts.classes_of (Sign.classes_of thy)) |> maps (fn c =>
+              (case try (Axclass.get_info thy) c of
+                SOME {def, intro, axioms, ...} => def :: intro :: axioms
+              | NONE => []));
+          val locale_intros =
+            Locale.get_locales thy |> maps (fn locale =>
+              let val (intro, intro') = Locale.intros_of thy locale
+              in the_list intro @ the_list intro' end);
+          val pred_defs =
+            locale_intros |> maps (fn intro =>
+              (case
+                Term.head_of (Object_Logic.drop_judgment ctxt
+                  (Logic.strip_imp_concl (Thm.prop_of intro))) of
+                Const (c, _) =>
+                  map_filter #def (Defs.specifications_of (Theory.defs_of thy) (Defs.Const, c))
+              | _ => []));
+        in
+          Thm_Name.Set.make
+            (map Thm.derivation_name (class_thms @ locale_intros) @
+              map (fn name => (name, 0)) pred_defs)
+        end);
+
+    (*axioms of locales, which Locale keeps as hypothetical theorems: by their exported statements,
+      as stored in the theory*)
+    val locale_axioms =
+      Lazy.lazy (fn () =>
+        Termtab.build (Locale.get_locales thy |> fold (fn locale =>
+          Locale.axioms_of thy locale |> fold (fn thm =>
+            Termtab.update (Thm.prop_of (Drule.export_without_context thm), ())))));
+
+    fun infrastructure_thm thm_name thm =
+      let val prop = Thm.prop_of thm in
+        is_hidden thm_name thm orelse
+        can Logic.dest_of_class (Logic.strip_imp_concl prop) orelse
+        Termtab.defined (Lazy.force locale_axioms) prop
+      end;
+  in
+    fn u as Theorem (thm_name as (name, _), _) =>
+        from_pure name orelse Thm_Name.Set.member (Lazy.force module_thm_names) thm_name orelse
+        (case use_thm ctxt u of
+          SOME thm => infrastructure_thm thm_name thm
+        | NONE => false)
+     | _ => false
+  end;
+
 (*uses that are named facts meeting the given find_theorems criteria*)
 fun use_filter state criteria =
   let
@@ -914,10 +1011,13 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
     val _ = report_bad ();
     val ctxt = Proof.context_of state;
     val pretty = pretty_use ctxt;
+    val shown =
+      if Config.get ctxt show_infrastructure then K true
+      else not o infrastructure ctxt;
     val printed =
       (case criteria of
-        SOME criteria => use_filter state criteria
-      | NONE => K true);
+        SOME criteria => (fn u => shown u andalso use_filter state criteria u)
+      | NONE => shown);
     fun on_use source u =
       if printed u then
         writeln (Pretty.string_of (Pretty.block [Pretty.str ("used (" ^ source ^ "): "),

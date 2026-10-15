@@ -559,6 +559,73 @@ proof -
     oops
 
 
+text \<open>
+  Infrastructure is not shown by default: theorems of Pure, class axioms, locale axioms, and
+  theorems declared with @{attribute apply_inspect_hide}.
+\<close>
+
+locale inf_base =
+  fixes u :: "nat \<Rightarrow> nat"
+  assumes u0: "u 0 = 0"
+
+locale inf_ext = inf_base +
+  assumes u1: "u 1 = 1"
+
+class inf_class = plus +
+  assumes inf_comm: "x + y = y + (x::'a)"
+
+lemma inf_hidden: "rev (rev xs) = xs" by simp
+
+declare inf_hidden [apply_inspect_hide]
+
+ML_val \<open>
+  let
+    val ctxt = \<^context>;
+    val infrastructure = Apply_Inspect.infrastructure ctxt;
+    fun theorem name i = Apply_Inspect.Theorem ((name, i), Position.none);
+    val hidden =
+      [theorem "Pure.protectI" 0, theorem "Pure.conjunctionI" 0,
+       theorem "HOL.eq_reflection" 0, theorem "Apply_Inspect_Test.inf_hidden" 0,
+       theorem "Nat.arity_type_nat" 0,
+       theorem "Apply_Inspect_Test.inf_class_class_def" 0,
+       theorem "Apply_Inspect_Test.inf_class_class.intro" 0,
+       theorem "Apply_Inspect_Test.inf_class_class.axioms" 0,
+       theorem "Apply_Inspect_Test.inf_class_class.super" 0,
+       theorem "Apply_Inspect_Test.class.inf_class_def" 0,
+       theorem "Apply_Inspect_Test.class.inf_class.intro" 0,
+       theorem "Apply_Inspect_Test.inf_base_def" 0,
+       theorem "Apply_Inspect_Test.inf_base.intro" 0,
+       theorem "Apply_Inspect_Test.inf_ext_axioms_def" 0,
+       theorem "Apply_Inspect_Test.inf_ext_axioms.intro" 0,
+       theorem "Apply_Inspect_Test.inf_ext_def" 0,
+       theorem "Apply_Inspect_Test.inf_ext.intro" 0,
+       theorem "Apply_Inspect_Test.inf_ext.axioms" 1,
+       theorem "Apply_Inspect_Test.inf_ext.axioms" 2];
+    val shown =
+      [theorem "HOL.conjI" 0, theorem "List.length_append" 0, theorem "Apply_Inspect_Test.Q_rev" 0,
+       theorem "Apply_Inspect_Test.inf_base.u0" 0, theorem "Apply_Inspect_Test.inf_ext.u1" 0,
+       theorem "Apply_Inspect_Test.inf_comm" 0, Apply_Inspect.Fact ("local.c", 0)];
+    val name = Thm_Name.print o (fn Apply_Inspect.Theorem (thm_name, _) => thm_name
+      | Apply_Inspect.Fact thm_name => thm_name | _ => Thm_Name.empty);
+    val _ =
+      (case filter_out infrastructure hidden of
+        [] => ()
+      | us => error ("Not infrastructure: " ^ commas (map name us)));
+    val _ =
+      (case filter infrastructure shown of
+        [] => ()
+      | us => error ("Infrastructure: " ^ commas (map name us)));
+  in () end\<close>
+
+text \<open>The attribute can be undone.\<close>
+
+declare inf_hidden [apply_inspect_hide del]
+
+ML_val \<open>
+  if Apply_Inspect.infrastructure \<^context>
+    (Apply_Inspect.Theorem (("Apply_Inspect_Test.inf_hidden", 0), Position.none))
+  then error "Still hidden" else ()\<close>
+
 text \<open>Reported uses can be filtered with find_theorems criteria.\<close>
 
 ML \<open>
