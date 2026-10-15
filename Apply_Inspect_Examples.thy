@@ -94,10 +94,11 @@ text \<open>
   With a time limit (@{attribute apply_inspect_timeout}, in milliseconds), the method is paused
   when the limit is reached, and the command continues with the goal state that the method has
   reached, as a skipped proof (like \<^theory_text>\<open>sorry\<close>). Each \<^theory_text>\<open>back\<close> continues
-  the method for another @{attribute apply_inspect_step_time} milliseconds (default 100) and
-  shows the goal state that it has reached then. Both are declaration attributes, e.g. for a
-  whole theory with \<^theory_text>\<open>declare [[apply_inspect_timeout = 1000]]\<close>. Here the classical
-  reasoner applies @{thm Q_step} again and again: each \<^theory_text>\<open>back\<close> shows a larger goal.
+  the method for another @{attribute apply_inspect_step_time} milliseconds (default 100),
+  lists the theorems used in that step, and shows the goal state that it has reached then.
+  Both are declaration attributes, e.g. for a whole theory with
+  \<^theory_text>\<open>declare [[apply_inspect_timeout = 1000]]\<close>. Here the classical reasoner applies
+  @{thm Q_step} again and again: each \<^theory_text>\<open>back\<close> shows a larger goal.
 \<close>
 
 lemma "Q 0"

@@ -158,7 +158,7 @@ fun stepped_subgoals n state src =
       {error = SOME msg, partial, ...} =>
         (case Seq.list_of (Seq.take n partial) of
           [] => error ("No goal states: " ^ msg)
-        | states => map (Thm.prems_of o #goal o Proof.simple_goal o #2) states)
+        | states => map (Thm.prems_of o #goal o Proof.simple_goal o #state) states)
     | _ => error "Method terminated")
   end;
 
@@ -201,6 +201,25 @@ lemma "Q 0"
         andalso not (has_duplicates (op =) depths)
       then ()
       else error ("Bad goal states: " ^ commas (map string_of_int depths))
+    end\<close>
+  oops
+
+text \<open>Each goal state comes with the theorems used since the previous one.\<close>
+
+lemma "Q 0"
+  ML_val \<open>
+    let
+      val proof_state = Toplevel.proof_of @{Isar.state};
+      val (text, _) =
+        Method.read_closure_input (Proof.context_of proof_state) (Input.string "(fast intro: Q_step)");
+      val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+      val limits = {timeout = seconds 0.2, step_time = seconds 0.1};
+      val {partial, ...} = Apply_Inspect.inspect_limited params limits text proof_state;
+      val uses = map (map use_name o #uses) (Seq.list_of (Seq.take 3 partial));
+    in
+      if length uses = 3 andalso
+        forall (fn names => member (op =) names "Apply_Inspect_Test.Q_step") uses
+      then () else error "Q_step not reported in each step"
     end\<close>
   oops
 

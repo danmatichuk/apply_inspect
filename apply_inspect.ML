@@ -44,7 +44,7 @@ sig
   val inspect_limited: params -> {timeout: Time.time, step_time: Time.time} ->
     Method.text -> Proof.state ->
     {succeeded: bool, error: string option, uses: use list,
-      partial: (Time.time * Proof.state) Seq.seq}
+      partial: {time: Time.time, state: Proof.state, uses: use list} Seq.seq}
   val pretty_uses: Proof.context -> use list -> Pretty.T
   val use_filter: Proof.state -> (bool * string Find_Theorems.criterion) list -> use -> bool
   val apply_inspect: (bool * string Find_Theorems.criterion) list option -> Method.text_range ->
@@ -685,8 +685,10 @@ datatype control = Run of Time.time | Pause | Done of bool Exn.result;
 val pause_check = seconds 1.0;
 
 (*goal state reached by a run of the method after the time limit: running time, refinement of
-  the goal (if any), and the outcome, if the method has finished*)
-type progress = {time: Time.time, refinement: term option, finished: bool Exn.result option};
+  the goal (if any), theorems used since the previous goal state (the first one: since the start),
+  and the outcome, if the method has finished*)
+type progress =
+  {time: Time.time, refinement: term option, uses: use list, finished: bool Exn.result option};
 
 (*result: outcome of the method (TIMEOUT if it exceeds the time limit), theorems used, and the
   goal states that it reaches: at the time limit, and after each further step, until it has
@@ -775,15 +777,14 @@ fun run params {timeout, step_time} text state =
       let
         val pos = Position.thread_data ();
         val context = Context.get_generic_context ();
+        val worker_params = Isabelle_Thread.params "apply_inspect" |> Isabelle_Thread.interrupts;
         val worker =
-          Isabelle_Thread.fork (Isabelle_Thread.params "apply_inspect" |> Isabelle_Thread.interrupts)
-            (fn () =>
-              let
-                val result =
-                  Exn.capture0
-                    (Position.setmp_thread_data pos (Context.setmp_generic_context context evaluate))
-                    ();
-              in Synchronized.change control (K (Done result)) end);
+          Isabelle_Thread.fork worker_params (fn () =>
+            let
+              val result =
+                Exn.capture0 (Position.setmp_thread_data pos
+                  (Context.setmp_generic_context context evaluate)) ();
+            in Synchronized.change control (K (Done result)) end);
 
         (*wait until the method pauses or finishes, or until the given time, if it does not reach
           a checkpoint (it then continues until it does)*)
@@ -797,11 +798,15 @@ fun run params {timeout, step_time} text state =
             val rest =
               if is_some finished then Seq.empty
               else Seq.make (fn () => Seq.pull (continue time));
-          in Seq.cons {time = time, refinement = refinement (), finished = finished} rest end
+            val p = {time = time, refinement = refinement (), uses = uses (), finished = finished};
+          in Seq.cons p rest end
         and continue time =
           let
             val _ = Weak.touch token;
             val _ = Synchronized.change output_pos (K (Position.thread_data ()));
+            (*each step collects (and reports) the theorems that it uses afresh*)
+            val _ = Synchronized.change collector (K Inttab.empty);
+            val _ = Synchronized.change hyps_collector (K Termtab.empty);
             val t0 = Time.now ();
             val step = Timeout.scale_time step_time;
             val _ = Synchronized.change control (fn c as Done _ => c | _ => Run (t0 + step));
@@ -809,8 +814,9 @@ fun run params {timeout, step_time} text state =
           in progress (time + (Time.now () - t0)) c end;
 
         (*the command may be interrupted while it waits*)
+        val first_limit = start + Timeout.scale_time (timeout + step_time);
         val c =
-          (case Exn.capture_body (fn () => await (start + Timeout.scale_time (timeout + step_time))) of
+          (case Exn.capture_body (fn () => await first_limit) of
             Exn.Res c => c
           | Exn.Exn exn => (Isabelle_Thread.interrupt_thread worker; Exn.reraise exn));
         val time = Time.now () - start;
@@ -834,18 +840,19 @@ fun refined_state state NONE = state
 
 (*error: exception raised by the method or by the instrumentation, as opposed to plain failure;
   partial: if the method exceeds the time limit, the proof states with the goal states that it
-  reaches (the given state while there is none), with its running time: at the time limit, and
-  after each further step, until it has finished (the last one is its result if it succeeds)*)
+  reaches (the given state while there is none), with its running time and the theorems used
+  since the previous one: at the time limit, and after each further step, until it has finished
+  (the last one is its result if it succeeds)*)
 fun inspect_limited params limits text state =
   let
     val {result, uses, progress} = run params limits text state;
     fun partial xq =
       Seq.make (fn () =>
         (case Seq.pull xq of
-          SOME ({time, refinement, finished = NONE}, xq') =>
-            SOME ((time, refined_state state refinement), partial xq')
-        | SOME ({time, refinement, finished = SOME (Exn.Res true)}, _) =>
-            SOME ((time, refined_state state refinement), Seq.empty)
+          SOME ({time, refinement, uses, finished = NONE}, xq') =>
+            SOME ({time = time, state = refined_state state refinement, uses = uses}, partial xq')
+        | SOME ({time, refinement, uses, finished = SOME (Exn.Res true)}, _) =>
+            SOME ({time = time, state = refined_state state refinement, uses = uses}, Seq.empty)
         | _ => NONE));
   in
     (case result of
@@ -943,8 +950,11 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
       Seq.make (fn () =>
         (case Seq.pull xq of
           NONE => NONE
-        | SOME ({time, refinement, finished}, xq') =>
+        | SOME ({time, refinement, uses, finished}, xq') =>
             let
+              val header =
+                if first then "theorems used before the timeout" else "theorems used in this step";
+              val _ = Pretty.writeln (pretty_use_list header ctxt (filter printed uses));
               val after = " after " ^ ms time;
               val goal_state =
                 (case refinement of
@@ -953,7 +963,7 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
                     "the goal state reached" ^
                     (case prev of
                       SOME prop' => if prop aconv prop' then " (unchanged)" else ""
-                    | NONE => "") ^ " (skipped proof)");
+                    | NONE => ""));
               val state' = refined_state state refinement;
             in
               (case finished of
@@ -971,10 +981,7 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
   in
     (case run params limits text state of
       {result = Exn.Res true, ...} => Proof.apply (text, range) state
-    | {result = Exn.Exn (Timeout.TIMEOUT _), uses, progress} =>
-        (Pretty.writeln (pretty_use_list "theorems used before the timeout" ctxt
-          (filter printed uses));
-         results true NONE progress)
+    | {result = Exn.Exn (Timeout.TIMEOUT _), progress, ...} => results true NONE progress
     | {result, uses, ...} =>
         (Pretty.writeln (pretty_uses ctxt (filter printed uses));
          (case result of
