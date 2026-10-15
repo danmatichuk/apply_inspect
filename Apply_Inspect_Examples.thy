@@ -112,35 +112,50 @@ text \<open>
   it is doing. If the simplifier, the classical reasoner or a repeated method keeps applying the
   same rules, a warning names them.
 
-  With a time limit (@{attribute apply_inspect_timeout}, in milliseconds), the method is paused
-  when the limit is reached, and the command continues with the goal state that the method has
-  reached, as a skipped proof (like \<^theory_text>\<open>sorry\<close>). Each \<^theory_text>\<open>back\<close> continues
-  the method for another @{attribute apply_inspect_step_time} milliseconds (default 100),
-  lists the theorems used in that step, and shows the goal state that it has reached then.
-  Both are declaration attributes, e.g. for a whole theory with
+  With a time limit (@{attribute apply_inspect_timeout}, in milliseconds), the method is stopped
+  when the limit is reached, and the command shows the goal states that it reached on the way, as
+  skipped proofs (like \<^theory_text>\<open>sorry\<close>): from @{attribute apply_inspect_trace_start}
+  on (default 0), every @{attribute apply_inspect_trace_interval} milliseconds (default 100). The
+  command shows the first of them, and each \<^theory_text>\<open>back\<close> the next one, up to the state
+  at the time limit, with the theorems used since the previous one. All of them are declaration
+  attributes, e.g. for a whole theory with
   \<^theory_text>\<open>declare [[apply_inspect_timeout = 1000]]\<close>. Here the classical reasoner applies
   @{thm Q_step} again and again: each \<^theory_text>\<open>back\<close> shows a larger goal.
 \<close>
 
 lemma "Q 0"
-  using [[apply_inspect_timeout = 1000, apply_inspect_step_time = 200]]
+  using [[apply_inspect_timeout = 1000, apply_inspect_trace_start = 500,
+    apply_inspect_trace_interval = 200]]
   apply_inspect (fast intro: Q_step)
   back
   back
   oops
 
 text \<open>
-  The method pauses only where it calls the instrumentation (method and classical steps,
-  rewrites, simprocs), and the goal state is the one after its last method or classical step. A
-  looping simplifier is paused in the middle of its work, so the goal state is the one before it
-  was called: here the two subgoals of @{thm conjI}, and a warning about the loop between
-  @{thm f_g} and @{thm g_f}.
+  Each goal state is computed by running the method again and stopping it at the point that it
+  had reached: the simplifier then returns the term that it has rewritten so far, so its progress
+  shows within the goal state, also when it is called by another method, e.g.
+  \<^theory_text>\<open>auto\<close>.
+\<close>
+
+axiomatization grow :: "nat \<Rightarrow> nat" where grow_Suc: "grow n = grow (Suc n)"
+
+lemma "grow 0 = 1 \<and> Q 0"
+  using [[apply_inspect_timeout = 500]]
+  apply_inspect (auto simp add: grow_Suc)
+  back
+  back
+  oops
+
+text \<open>
+  The goal state can be worked on as usual: here the two subgoals of @{thm conjI}, after a warning
+  about the loop between @{thm f_g} and @{thm g_f}.
 \<close>
 
 lemma "f 0 = 1 \<and> Q 0"
   using [[apply_inspect_timeout = 1000]]
   apply_inspect (rule conjI, simp add: f_g g_f)
-  txt \<open>The goal state can be worked on as usual, e.g. to look at the other subgoal.\<close>
+  txt \<open>For example, to look at the other subgoal.\<close>
   prefer 2
   apply (simp add: Q_def)
   oops

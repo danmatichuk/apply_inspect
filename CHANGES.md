@@ -21,25 +21,26 @@
   that is not meant to stay in a proof.
 
 - New option `apply_inspect_timeout` (int, milliseconds; default `0`, no limit). If the method
-  of `apply_inspect` exceeds it, the theorems used so far are reported, the method is paused,
-  and the command continues with the goal state that it has reached (after its last method
-  or classical step), as a skipped proof (oracle `skip_proof`). Each `back` continues the
-  method for `apply_inspect_step_time` milliseconds (default `100`), reports the theorems used
-  in that step, and yields the goal state reached then, so that `back` steps through the run
-  of the method, without a limit on the total time; if the method finishes, its result is the
-  last goal state. The method pauses only where the instrumentation is called (method and
-  classical steps, rewrites, simprocs), so a looping simplifier shows the goal state before
-  it was called. Subgoals that goal restriction hid (e.g. in `SELECT_GOAL`) are kept,
-  possibly in a different order. A paused method is stopped once its goal states are no
-  longer referenced, e.g. after the command has been removed. `Apply_Inspect.inspect_limited`
-  offers the same in ML.
+  of `apply_inspect` exceeds it, the method is frozen: the simplifier stops rewriting (so that
+  it returns the term that it has reached) and no further method or classical step starts; a
+  method that still does not finish (e.g. `blast`) is interrupted one second later. The
+  command then shows the goal states that the method reached, as skipped proofs (oracle
+  `skip_proof`): from `apply_inspect_trace_start` on (default `0`), every
+  `apply_inspect_trace_interval` milliseconds (default `100`), up to the state at the time
+  limit. The command shows the first of them and each `back` the next one, with the theorems
+  used since the previous one. Each state is computed when it is shown, by replaying the
+  method and freezing it after the number of steps and rewrites that it had reached, so the
+  partial result of a looping simplifier shows within the goal state, also inside other
+  methods such as `auto`. Subgoals that goal restriction hid (e.g. in `SELECT_GOAL`) are
+  kept, possibly in a different order. `Apply_Inspect.inspect_limited` offers the same in ML.
 
   ```isabelle
-  declare [[apply_inspect_timeout = 5000, apply_inspect_step_time = 200]]
+  declare [[apply_inspect_timeout = 5000, apply_inspect_trace_start = 4000,
+    apply_inspect_trace_interval = 200]]
 
   lemma ...
-    apply_inspect auto
-    back  (* continue for another 200 ms *)
+    apply_inspect auto  (* the goal state after 4000 ms *)
+    back                (* after 4200 ms *)
   ```
 
 - The instrumented run copies goal states with the oracle `skip_proof` instead of an
