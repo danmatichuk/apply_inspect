@@ -9,8 +9,10 @@ own), in a context where the classical reasoner and the simplifier record
 every intermediate goal state they see, and the simplifier records every
 rewrite rule it tries. Before each method or classical step, the goal state
 is copied again in the same way, so that the result of the step depends on
-exactly the theorems that the step used. The results of that run are
-discarded: if the method succeeds, it is run again without instrumentation.
+exactly the theorems that the step used. The method is not run again: if it
+succeeds, the command continues with the goal state that the instrumented run
+has produced, as a skipped proof, since the command is a diagnostic tool that
+is not meant to stay in a finished proof.
 
 If the method exceeds the time limit apply_inspect_timeout (in ms), it is
 frozen: the simplifier stops rewriting (so that it returns the term that it
@@ -50,8 +52,11 @@ sig
   val inspect_limited: params ->
     {timeout: Time.time, trace_start: Time.time, trace_interval: Time.time} ->
     Method.text -> Proof.state ->
-    {succeeded: bool, error: string option, uses: use list,
-      partial: {time: Time.time, state: Proof.state, uses: use list} Seq.seq}
+    {succeeded: bool, error: string option, uses: use list, use_counts: (use * int) list,
+      partial:
+        {time: Time.time, state: Proof.state, uses: use list, use_counts: (use * int) list}
+          Seq.seq,
+      final: Proof.state option}
   val pretty_uses: Proof.context -> use list -> Pretty.T
   val infrastructure: Proof.context -> use -> bool
   val use_filter: Proof.state -> (bool * string Find_Theorems.criterion) list -> use -> bool
@@ -337,8 +342,9 @@ fun is_closure_state st = Thm.prop_of st aconv closure_state;
 
 (*proposition of an intermediate goal state as a refinement of the goal, with the subgoals that
   goal restriction hides (Goal.restrict, e.g. in SELECT_GOAL) in a different order; NONE for
-  goal states of other goals, e.g. of conditions of rewrite rules or of focused subgoals*)
-fun goal_refinement goal st =
+  goal states of other goals, e.g. of conditions of rewrite rules or of focused subgoals, which
+  have hypotheses other than those of the goal and the assumptions of the proof context*)
+fun goal_refinement assms goal st =
   let
     val concl = Thm.concl_of goal;
     fun unfold prems t =
@@ -348,7 +354,7 @@ fun goal_refinement goal st =
           SOME u => unfold (prems @ Logic.strip_imp_prems u) (Logic.strip_imp_concl u)
         | NONE => NONE);
   in
-    if subset (op aconv) (Thm.hyps_of st, Thm.hyps_of goal)
+    if subset (op aconv) (Thm.hyps_of st, Thm.hyps_of goal @ assms)
     then unfold (Thm.prems_of st) (Thm.concl_of st) else NONE
   end;
 
@@ -458,8 +464,11 @@ type params =
   on_loop: string -> use list -> unit};
 
 (*collector: serial of each dependency seen so far, with its name if it is a named theorem;
-  hyps_collector: hypotheses seen so far*)
-fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: params) : events =
+  hyps_collector: hypotheses seen so far;
+  count: called once for each theorem used by a method or classical step, and for the rule of
+  each successful rewrite*)
+fun make_events ctxt collector hyps_collector count
+    ({every_use, on_use, on_loop}: params) : events =
   let
     val thy = Proof_Context.theory_of ctxt;
     val facts = Global_Theory.facts_of thy;
@@ -540,6 +549,9 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
               if every_use then (add_deps tab; add_hyps hyps; emit source (uses_of tab) hyps)
               else observe source output
           | NONE => observe source output);
+        val _ =
+          used |> Option.app (fn (tab, hyps) =>
+            (List.app count (uses_of tab); List.app (count o assumption) hyps));
         val rule =
           (case used of
             SOME (tab, hyps) =>
@@ -597,6 +609,7 @@ fun make_events ctxt collector hyps_collector ({every_use, on_use, on_loop}: par
             use "simp" (the_default [] (thm_deps instance))
               (context_hyps (Thm.hyps_of instance))
           else observe "simp" instance;
+        val _ = if is_some result then count (rule_use (name, rule)) else ();
         val loop_step =
           {rule = (name, rule), size = size_of_term redex, output = result,
             follows = exists_subterm (fn t => t aconv redex)};
@@ -726,9 +739,10 @@ fun run_instrumented (events: events) {budget, deadline, time_limit, on_event} t
     val {context = goal_ctxt, facts = using, goal} = Proof.raw_goal state;
 
     (*the goal state that the method last reached*)
+    val assms = map Thm.term_of (Assumption.all_assms_of goal_ctxt);
     val last = Synchronized.var "apply_inspect_last" NONE;
     fun record st =
-      (case goal_refinement goal st of
+      (case goal_refinement assms goal st of
         SOME prop => Synchronized.change last (K (SOME prop))
       | NONE => ());
     val events' =
@@ -779,16 +793,27 @@ fun same_use (Assumption (name, t), Assumption (name', t')) = name = name' andal
         (SOME k, SOME k') => k = k'
       | _ => false);
 
+(*uses with their numbers of uses, most frequent first*)
+val sort_counts = sort (rev_order o int_ord o apply2 #2);
+
+fun add_count n u counts =
+  let
+    fun add [] = [(u, n)]
+      | add ((u', m) :: rest) =
+          if same_use (u, u') then (u', m + n) :: rest else (u', m) :: add rest;
+  in add counts end;
+
 (*the uses of several parts of a run, without repetitions*)
-val merge_uses = distinct same_use;
+fun merge_counts countss = sort_counts (fold (fold (fn (u, n) => add_count n u)) countss []);
 
 (*goal state of a run that exceeds the time limit: time since the start, theorems used since
-  the previous one, and the goal state then, as a refinement of the goal, computed when needed*)
-type trace_state = {time: Time.time, uses: use list, refinement: term option lazy};
+  the previous one with their numbers of uses, and the goal state then, as a refinement of the
+  goal, computed when needed*)
+type trace_state = {time: Time.time, uses: (use * int) list, refinement: term option lazy};
 
-(*result: outcome of the method (TIMEOUT if it exceeds the time limit), theorems used, and the
-  goal states that it reaches: from the start of the trace on in the given intervals, up to the
-  state at the time limit*)
+(*result: outcome of the method (TIMEOUT if it exceeds the time limit), theorems used, the
+  goal states that it reaches (from the start of the trace on in the given intervals, up to the
+  state at the time limit), and the goal state that it has reached at the end*)
 fun run params {timeout, trace_start, trace_interval} text state =
   let
     val ctxt = Proof.context_of state;
@@ -808,13 +833,27 @@ fun run params {timeout, trace_start, trace_interval} text state =
 
     val collector = Synchronized.var "apply_inspect" Inttab.empty;
     val hyps_collector = Synchronized.var "apply_inspect_hyps" Termtab.empty;
-    val events = make_events ctxt collector hyps_collector params';
-    fun uses () = collected_uses ctxt collector hyps_collector;
+    val counts = Synchronized.var "apply_inspect_counts" [];
+    fun count u = Synchronized.change counts (add_count 1 u);
+    val events = make_events ctxt collector hyps_collector count params';
+    (*theorems used, with their numbers of uses (at least one, e.g. for theorems that the goal
+      states depend on, but no step is known to have used)*)
+    fun uses () =
+      let
+        val cs = Synchronized.value counts;
+        fun count_of u =
+          the_default 1 (get_first (fn (u', n) => if same_use (u, u') then SOME n else NONE) cs);
+      in
+        collected_uses ctxt collector hyps_collector
+        |> map (fn u => (u, count_of u))
+        |> sort_counts
+      end;
     (*each part of the trace collects (and reports) the theorems that it uses afresh*)
     fun take_uses () =
       uses () before
         (Synchronized.change collector (K Inttab.empty);
-         Synchronized.change hyps_collector (K Termtab.empty));
+         Synchronized.change hyps_collector (K Termtab.empty);
+         Synchronized.change counts (K []));
 
     (*samples, most recent first: time, number of events before it, and the theorems used since
       the previous one; only before the time limit, where the run itself shows its goal state*)
@@ -865,14 +904,17 @@ fun run params {timeout, trace_start, trace_interval} text state =
           {time = sample_time, uses = sample_uses,
             refinement = Lazy.lazy (fn () => replay (sample_time, budget))});
     val trace' = trace @ [{time = time, uses = final_uses, refinement = Lazy.value refinement}];
-    val all_uses = merge_uses (maps #uses trace');
+    val all_uses = merge_counts (map #uses trace');
   in
     (case result of
       Exn.Res _ =>
-        if frozen then {result = Exn.Exn (Timeout.TIMEOUT time), uses = all_uses, trace = trace'}
-        else {result = result, uses = all_uses, trace = []}
-    | Exn.Exn (Timeout.TIMEOUT _) => {result = result, uses = all_uses, trace = trace'}
-    | Exn.Exn _ => {result = result, uses = all_uses, trace = []})
+        if frozen then
+          {result = Exn.Exn (Timeout.TIMEOUT time), uses = all_uses, trace = trace',
+            final = refinement}
+        else {result = result, uses = all_uses, trace = [], final = refinement}
+    | Exn.Exn (Timeout.TIMEOUT _) =>
+        {result = result, uses = all_uses, trace = trace', final = refinement}
+    | Exn.Exn _ => {result = result, uses = all_uses, trace = [], final = refinement})
   end;
 
 (*proof state with the goal refined to the given proposition by the oracle of skipped proofs, as
@@ -889,19 +931,29 @@ fun refined_state state NONE = state
   partial: if the method exceeds the time limit, the proof states with the goal states that it
   reaches (the given state while there is none), with the time since the start and the theorems
   used since the previous one: from the start of the trace on, up to the time limit; each one is
-  computed when it is needed*)
+  computed when it is needed;
+  final: the proof state with the goal state that the method has reached, if it succeeds or
+  exceeds the time limit (as a refinement of the goal by oracle, like the others)*)
 fun inspect_limited params limits text state =
   let
-    val {result, uses, trace} = run params limits text state;
+    val {result, uses, trace, final} = run params limits text state;
+    fun final_state () = refined_state state final;
     val partial =
       Seq.of_list trace |> Seq.map (fn {time, uses, refinement} =>
-        {time = time, state = refined_state state (Lazy.force refinement), uses = uses});
+        {time = time, state = refined_state state (Lazy.force refinement), uses = map #1 uses,
+          use_counts = uses});
   in
     (case result of
-      Exn.Res b => {succeeded = b, error = NONE, uses = uses, partial = Seq.empty}
+      Exn.Res b =>
+        {succeeded = b, error = NONE, uses = map #1 uses, use_counts = uses, partial = Seq.empty,
+          final = if b then SOME (final_state ()) else NONE}
     | Exn.Exn exn =>
-        {succeeded = false, error = SOME (Runtime.exn_message exn), uses = uses,
-          partial = partial})
+        {succeeded = false, error = SOME (Runtime.exn_message exn), uses = map #1 uses,
+          use_counts = uses, partial = partial,
+          final =
+            (case exn of
+              Timeout.TIMEOUT _ => SOME (final_state ())
+            | _ => NONE)})
   end;
 
 fun inspect params text state =
@@ -911,19 +963,28 @@ fun inspect params text state =
     val {succeeded, error, uses, ...} = inspect_limited params limits text state;
   in {succeeded = succeeded, error = error, uses = uses} end;
 
+(*uses with their numbers of uses (if known): most frequent first, then by name*)
 fun pretty_use_list header ctxt uses =
   let
     val pretty = pretty_use ctxt;
+    fun times 1 = "1 use"
+      | times n = string_of_int n ^ " uses";
     val items =
       uses
-      |> map (fn u => let val prt = pretty u in (Pretty.unformatted_string_of prt, prt) end)
-      |> sort_by #1
-      |> map (fn (_, prt) => Pretty.item [prt]);
+      |> map (fn (u, n) =>
+          let val prt = pretty u
+          in ((the_default 0 n, Pretty.unformatted_string_of prt), (prt, n)) end)
+      |> sort (prod_ord (rev_order o int_ord) string_ord o apply2 #1)
+      |> map (fn (_, (prt, n)) =>
+          Pretty.item
+            (prt :: (case n of SOME n => [Pretty.str (" (" ^ times n ^ ")")] | NONE => [])));
   in
     Pretty.big_list (header ^ ": " ^ string_of_int (length items)) items
   end;
 
-val pretty_uses = pretty_use_list "theorems used in failed method application";
+val failed_header = "theorems used in failed method application";
+fun pretty_uses ctxt = pretty_use_list failed_header ctxt o map (rpair NONE);
+fun pretty_counted_uses ctxt = pretty_use_list failed_header ctxt o map (apsnd SOME);
 
 
 (* filter *)
@@ -1042,7 +1103,7 @@ fun use_filter state criteria =
 fun report_bad () =
   Output.report [Markup.markup (Markup.bad ()) "Diagnostic proof command"];
 
-fun apply_inspect criteria (text, range as (pos, _)) state =
+fun apply_inspect criteria (text, (pos, _)) state =
   let
     val _ = report_bad ();
     val ctxt = Proof.context_of state;
@@ -1092,7 +1153,7 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
                   val _ =
                     Pretty.writeln (pretty_use_list
                       ("theorems used from " ^ ms prev_time ^ " to " ^ ms time) ctxt
-                      (filter printed uses));
+                      (map (apsnd SOME) (filter (printed o #1) uses)));
                   val refinement' = Lazy.force refinement;
                   val goal_state =
                     (case refinement' of
@@ -1117,10 +1178,10 @@ fun apply_inspect criteria (text, range as (pos, _)) state =
       in result 1 Time.zeroTime NONE trace end;
   in
     (case run params limits text state of
-      {result = Exn.Res true, ...} => Proof.apply (text, range) state
+      {result = Exn.Res true, final, ...} => Seq.single (Seq.Result (refined_state state final))
     | {result = Exn.Exn (Timeout.TIMEOUT t), trace, ...} => results t trace
     | {result, uses, ...} =>
-        (Pretty.writeln (pretty_uses ctxt (filter printed uses));
+        (Pretty.writeln (pretty_counted_uses ctxt (filter (printed o #1) uses));
          (case result of
            Exn.Exn exn => Exn.reraise exn
          | Exn.Res _ => Seq.single (Proof_Display.method_error "" pos (Proof.raw_goal state)))))

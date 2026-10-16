@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- The lists of theorems used show how often each theorem was used (by method and classical
+  steps, and by successful rewrites), most frequent first; for a looping method, the rules
+  of the loop come first. `Apply_Inspect.inspect_limited` returns the numbers as
+  `use_counts`, also for each traced goal state; its `uses` are in the same order.
+
+- `apply_inspect` no longer runs a successful method a second time without instrumentation:
+  it continues with the goal state of the instrumented run, as a skipped proof (oracle
+  `skip_proof`), since the command is not meant to stay in a finished proof.
+  `Apply_Inspect.inspect_limited` returns this state as `final` (also the state at the time
+  limit after a timeout; `NONE` if the method fails). Goal states that carry assumptions of
+  the proof context (e.g. in a `context` with `assumes`) are no longer mistaken for goal
+  states of other goals.
+
 - `apply_inspect` no longer reports infrastructure: theorems of Pure, class axioms
   (definition, introduction rule and axioms of a class as recorded by `Axclass`, and
   theorems concluding a sort constraint, e.g. class relations and arities), locale axioms

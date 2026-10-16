@@ -163,7 +163,10 @@ fun traced_states state src =
     | _ => error "Method terminated")
   end;
 
-fun subgoals_of ({state, ...}: {time: Time.time, state: Proof.state, uses: Apply_Inspect.use list}) =
+fun subgoals_of
+    ({state, ...}:
+      {time: Time.time, state: Proof.state, uses: Apply_Inspect.use list,
+        use_counts: (Apply_Inspect.use * int) list}) =
   Thm.prems_of (#goal (Proof.simple_goal state));
 val traced_subgoals = map subgoals_of oo traced_states;
 val first_subgoals = hd oo traced_subgoals;
@@ -245,6 +248,25 @@ lemma "Q 0"
     end\<close>
   oops
 
+text \<open>The theorems come with their numbers of uses, most frequent first.\<close>
+
+lemma "f 0 = 1 \<and> Q 0"
+  ML_val \<open>
+    let
+      val counts =
+        traced_states @{Isar.state} "(rule conjI, simp add: f_g g_f)"
+        |> hd |> #use_counts |> map (apfst use_name);
+      val count = the_default 0 o AList.lookup (op =) counts;
+    in
+      if count "Apply_Inspect_Test.f_g" > 1 andalso count "Apply_Inspect_Test.g_f" > 1 andalso
+        count "HOL.conjI" = 1 andalso
+        map #2 counts = sort (rev_order o int_ord) (map #2 counts)
+      then ()
+      else error ("Bad counts: " ^
+        commas (map (fn (name, n) => name ^ " " ^ string_of_int n) counts))
+    end\<close>
+  oops
+
 text \<open>Without progress, the goal is unchanged.\<close>
 
 lemma "f 0 = 1"
@@ -253,20 +275,48 @@ lemma "f 0 = 1"
     else error "Bad goal state"\<close>
   oops
 
-text \<open>A method that finishes within the time limit is not traced.\<close>
+text \<open>
+  A method that finishes within the time limit is not traced. The final goal state is the one
+  that the method has reached: its result if it succeeds, the state at the time limit if it
+  exceeds it, and none if it fails.
+\<close>
 
-lemma "rev (rev xs) = xs"
+ML \<open>
+fun final_subgoals state src =
+  let
+    val proof_state = Toplevel.proof_of state;
+    val (text, _) = Method.read_closure_input (Proof.context_of proof_state) (Input.string src);
+    val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+    val {partial, final, ...} =
+      Apply_Inspect.inspect_limited params trace_limits text proof_state;
+    val traced = is_some (Seq.pull partial);
+  in (traced, Option.map (Thm.prems_of o #goal o Proof.simple_goal) final) end;
+\<close>
+
+lemma "rev (rev xs) = xs \<and> xs @ [] = (xs::nat list)"
+  ML_val \<open>
+    (case final_subgoals @{Isar.state} "(rule conjI)" of
+      (false, SOME [\<^prop>\<open>rev (rev xs) = (xs::nat list)\<close>, \<^prop>\<open>xs @ [] = (xs::nat list)\<close>]) => ()
+    | _ => error "Bad final state after rule")\<close>
+  ML_val \<open>
+    (case final_subgoals @{Isar.state} "simp" of
+      (false, SOME []) => ()
+    | _ => error "Bad final state after simp")\<close>
+  ML_val \<open>
+    (case final_subgoals @{Isar.state} "(rule disjI1)" of
+      (false, NONE) => ()
+    | _ => error "Final state after failure")\<close>
+  oops
+
+lemma "Q 0"
   ML_val \<open>
     let
-      val proof_state = Toplevel.proof_of @{Isar.state};
-      val (text, _) =
-        Method.read_closure_input (Proof.context_of proof_state) (Input.string "simp");
-      val params = {every_use = false, on_use = K (K ()), on_loop = K (K ())};
+      val (traced, final) = final_subgoals @{Isar.state} "(fast intro: Q_step)";
     in
-      (case Apply_Inspect.inspect_limited params trace_limits text proof_state of
-        {succeeded = true, error = NONE, partial, ...} =>
-          if is_none (Seq.pull partial) then () else error "Traced"
-      | _ => error "Method failed")
+      (case final of
+        SOME subgoals =>
+          if traced andalso q_depth subgoals > 0 then () else error "Bad final state"
+      | NONE => error "No final state after timeout")
     end\<close>
   oops
 
