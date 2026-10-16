@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- If the method fails, `apply_inspect` no longer fails like `apply`: it continues with the
+  goal state that the method reached last before the failure (after its last method or
+  classical step), as a skipped proof, with a warning; it still fails if the method got
+  nowhere. `Apply_Inspect.inspect_limited` returns this state as `final`.
+
 - The lists of theorems used show how often each theorem was used (by method and classical
   steps, and by successful rewrites), most frequent first; for a looping method, the rules
   of the loop come first. `Apply_Inspect.inspect_limited` returns the numbers as

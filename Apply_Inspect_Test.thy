@@ -58,6 +58,21 @@ lemma "rev (rev xs) = xs \<and> xs @ [] = xs"
   done
 
 
+text \<open>
+  Failure after some progress: the command continues with the goal state that the method
+  reached last.
+\<close>
+
+lemma "(xs = ys \<and> ys = zs) \<and> zs = (xs::nat list)"
+  apply_inspect (rule conjI, rule conjI, fail)
+  ML_val \<open>
+    if Thm.prems_of (#goal (Proof.simple_goal (Toplevel.proof_of @{Isar.state}))) =
+      [\<^prop>\<open>xs = (ys::nat list)\<close>, \<^prop>\<open>ys = (zs::nat list)\<close>,
+       \<^prop>\<open>zs = (xs::nat list)\<close>]
+    then () else error "Bad goal state after failure"\<close>
+  oops
+
+
 text \<open>Failure at the end of a sequence of methods.\<close>
 
 lemma "rev (rev xs) = xs \<and> xs = ys"
@@ -277,8 +292,8 @@ lemma "f 0 = 1"
 
 text \<open>
   A method that finishes within the time limit is not traced. The final goal state is the one
-  that the method has reached: its result if it succeeds, the state at the time limit if it
-  exceeds it, and none if it fails.
+  that the method has reached last: its result if it succeeds, the state at the time limit if it
+  exceeds it, and the last state before it failed (none if it did not get anywhere).
 \<close>
 
 ML \<open>
@@ -305,7 +320,11 @@ lemma "rev (rev xs) = xs \<and> xs @ [] = (xs::nat list)"
   ML_val \<open>
     (case final_subgoals @{Isar.state} "(rule disjI1)" of
       (false, NONE) => ()
-    | _ => error "Final state after failure")\<close>
+    | _ => error "Final state after failure without progress")\<close>
+  ML_val \<open>
+    (case final_subgoals @{Isar.state} "(rule conjI, simp, fail)" of
+      (false, SOME [\<^prop>\<open>xs @ [] = (xs::nat list)\<close>]) => ()
+    | _ => error "Bad last state before failure")\<close>
   oops
 
 lemma "Q 0"

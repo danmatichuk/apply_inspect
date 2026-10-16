@@ -1,8 +1,8 @@
 (*  Title:      Apply_Inspect_Examples.thy
 
 Examples for "apply_inspect". Open this theory in the Prover IDE and look at the output of the
-apply_inspect commands. The examples of failing methods are errors on purpose, so the theory is
-not part of the session in ROOT.
+apply_inspect commands. The theory is not part of the session in ROOT: it is meant to be read in
+the Prover IDE, and its examples of time limits take a few seconds.
 *)
 
 theory Apply_Inspect_Examples
@@ -25,9 +25,11 @@ lemma "rev (rev xs) = xs \<and> xs @ [] = xs"
 section \<open>Failed methods\<close>
 
 text \<open>
-  If the method fails, the command fails like \<^theory_text>\<open>apply\<close>, but it first lists the
-  theorems that the method used before it gave up, with the attributes under which they are
-  declared (e.g. \<open>[simp]\<close>). Here \<^theory_text>\<open>fastforce\<close> rewrites with
+  If the method fails, the command lists the theorems that the method used before it gave up,
+  with the attributes under which they are declared (e.g. \<open>[simp]\<close>) and how often they
+  were used. It then continues with the goal state that the method reached last, as a skipped
+  proof, and warns about it; only if the method got nowhere does the command fail like
+  \<^theory_text>\<open>apply\<close>. Here \<^theory_text>\<open>fastforce\<close> rewrites with
   @{thm length_append} but cannot prove \<open>xs = ys\<close>.
 \<close>
 

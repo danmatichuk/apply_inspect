@@ -9,10 +9,12 @@ own), in a context where the classical reasoner and the simplifier record
 every intermediate goal state they see, and the simplifier records every
 rewrite rule it tries. Before each method or classical step, the goal state
 is copied again in the same way, so that the result of the step depends on
-exactly the theorems that the step used. The method is not run again: if it
-succeeds, the command continues with the goal state that the instrumented run
-has produced, as a skipped proof, since the command is a diagnostic tool that
-is not meant to stay in a finished proof.
+exactly the theorems that the step used. The method is not run again: the
+command continues with the goal state that the instrumented run has reached
+last, as a skipped proof, since the command is a diagnostic tool that is not
+meant to stay in a finished proof. This is the result of the method if it
+succeeds, and the goal state after its last method or classical step if it
+fails (with a warning; it is an error only if the method got nowhere).
 
 If the method exceeds the time limit apply_inspect_timeout (in ms), it is
 frozen: the simplifier stops rewriting (so that it returns the term that it
@@ -932,8 +934,10 @@ fun refined_state state NONE = state
   reaches (the given state while there is none), with the time since the start and the theorems
   used since the previous one: from the start of the trace on, up to the time limit; each one is
   computed when it is needed;
-  final: the proof state with the goal state that the method has reached, if it succeeds or
-  exceeds the time limit (as a refinement of the goal by oracle, like the others)*)
+  final: the proof state with the goal state that the method has reached last (as a refinement
+  of the goal by oracle, like the others): its result if it succeeds, the state at the time
+  limit if it exceeds it, and the last goal state of a method or classical step before it
+  failed (NONE if there is none)*)
 fun inspect_limited params limits text state =
   let
     val {result, uses, trace, final} = run params limits text state;
@@ -946,14 +950,14 @@ fun inspect_limited params limits text state =
     (case result of
       Exn.Res b =>
         {succeeded = b, error = NONE, uses = map #1 uses, use_counts = uses, partial = Seq.empty,
-          final = if b then SOME (final_state ()) else NONE}
+          final = if b orelse is_some final then SOME (final_state ()) else NONE}
     | Exn.Exn exn =>
         {succeeded = false, error = SOME (Runtime.exn_message exn), uses = map #1 uses,
           use_counts = uses, partial = partial,
           final =
             (case exn of
               Timeout.TIMEOUT _ => SOME (final_state ())
-            | _ => NONE)})
+            | _ => if is_some final then SOME (final_state ()) else NONE)})
   end;
 
 fun inspect params text state =
@@ -1180,11 +1184,23 @@ fun apply_inspect criteria (text, (pos, _)) state =
     (case run params limits text state of
       {result = Exn.Res true, final, ...} => Seq.single (Seq.Result (refined_state state final))
     | {result = Exn.Exn (Timeout.TIMEOUT t), trace, ...} => results t trace
-    | {result, uses, ...} =>
+    | {result, uses, final, ...} =>
         (Pretty.writeln (pretty_counted_uses ctxt (filter (printed o #1) uses));
-         (case result of
-           Exn.Exn exn => Exn.reraise exn
-         | Exn.Res _ => Seq.single (Proof_Display.method_error "" pos (Proof.raw_goal state)))))
+         (*a failed method that has got somewhere leaves the goal state that it reached last*)
+         (case (result, final) of
+           (Exn.Exn exn, _) =>
+             if Exn.is_interrupt exn orelse is_none final then Exn.reraise exn
+             else
+               (warning ("Proof method failed: " ^ Runtime.exn_message exn ^
+                  "\nContinuing with the goal state that it reached last (skipped proof)");
+                Seq.single (Seq.Result (refined_state state final)))
+         | (Exn.Res _, SOME _) =>
+             (warning
+               "Proof method failed; continuing with the goal state that it reached last \
+               \(skipped proof)";
+              Seq.single (Seq.Result (refined_state state final)))
+         | (Exn.Res _, NONE) =>
+             Seq.single (Proof_Display.method_error "" pos (Proof.raw_goal state)))))
   end;
 
 val criteria =
