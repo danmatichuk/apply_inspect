@@ -197,7 +197,7 @@ fun strictly_increasing (x :: (rest as y :: _)) = x < y andalso strictly_increas
   | strictly_increasing _ = true;
 
 fun sleep_method t =
-  "(tactic \<open>fn st => (if Thm.nprems_of st > 0 then OS.Process.sleep (seconds " ^ t ^
+  "(tactic \<open>fn st => (if Thm.nprems_of st > 0 then Time.sleep (seconds " ^ t ^
     ") else (); all_tac st)\<close>)";
 \<close>
 
